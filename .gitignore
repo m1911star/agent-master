@@ -7,6 +7,9 @@ __pycache__/
 venv/
 .python-version
 
+# uv
+.uv/
+
 # Editors / OS
 .DS_Store
 .idea/
@@ -24,3 +27,13 @@ scratch/
 events.db
 events.db-*
 *.log
+
+# Test / build / cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+dist/
+build/
