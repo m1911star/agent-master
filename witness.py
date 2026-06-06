@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 m1911star
 """
 Agent Witness — multi-agent observability spike.
 

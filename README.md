@@ -93,4 +93,4 @@ Everything stays on your machine. The dashboard binds to `127.0.0.1` only. Tool 
 
 ## License
 
-TBD (probably MIT or Apache-2.0).
+[Apache-2.0](./LICENSE)
