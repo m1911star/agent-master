@@ -237,6 +237,18 @@ def main():
 
 ## V0.1 三个 adapter 的具体规划
 
+### OpenCode adapter
+
+| 维度 | 实现 |
+|------|------|
+| Observer 数据源 | `~/.local/share/opencode/opencode.db`（SQLite + Drizzle 迁移） |
+| watch 方式 | WAL tail，poll 200ms |
+| session_id | `session.id`（`ses_xxx` 前缀） |
+| parent_id | `session.parent_id`（直接有！） |
+| event 流 | `event` 表已 event-sourced，按 `aggregate_id + seq` 读 |
+| cost/tokens | session 表上有 `cost`/`tokens_input`/`tokens_output`/`tokens_reasoning`/`tokens_cache_*` |
+| 已知坑 | DB 350MB，启动时只读最近 24h 的 session 防爆 |
+
 ### Claude Code adapter
 
 | 维度 | 实现 |
@@ -246,16 +258,6 @@ def main():
 | session_id | filename stem |
 | parent_id | `sidechain.parent_id` 字段 |
 | 已知坑 | flush 间隔 866-988ms，是行级实时 |
-
-### Codex adapter
-
-| 维度 | 实现 |
-|------|------|
-| Observer 数据源 | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` |
-| watch 方式 | fsevents + 路径模式 |
-| session_id | 文件名中的 uuid |
-| parent_id | 暂无（codex 不 sidechain） |
-| 已知坑 | flush 14-17ms，近 token 级实时 |
 
 ### Hermes adapter
 

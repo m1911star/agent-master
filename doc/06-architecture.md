@@ -223,14 +223,16 @@ backup_retention_days = 7
 auto_open_browser = true
 
 [adapters]
-enabled = ["claude_code", "codex", "hermes"]
+enabled = ["opencode", "claude_code", "hermes"]
+
+[adapters.opencode]
+db_path = "~/.local/share/opencode/opencode.db"
+poll_ms = 200
+recent_hours = 24  # 启动时只装载最近 24h 的 session，防止 350MB DB 全扫
 
 [adapters.claude_code]
 projects_dir = "~/.claude/projects"
 poll_fallback_ms = 1000
-
-[adapters.codex]
-sessions_dir = "~/.codex/sessions"
 
 [adapters.hermes]
 db_path = "~/.hermes/state.db"

@@ -88,7 +88,7 @@
 按"观测层 → 编排层 → workflow 可视化 → HITL"的顺序推进。每阶段都是可用的产品，不是 demo。
 
 ### V0.1 · 观测层（夯实地基）
-- 3 个 adapter：Claude Code / Codex / Hermes（read-only 模式，扒文件，不打扰 agent）
+- 3 个 adapter：OpenCode / Claude Code / Hermes（read-only 模式，扒文件/DB，不打扰 agent）
 - 实时事件流：fsevents + sqlite WAL tail，L1 状态级实时（1-3 秒延迟）
 - session 列表 + 单 session 实时视图（事件流 + 进度）
 - 简单拓扑图：session 父子/sidechain（hermes 直接有，claude/codex 从 metadata 推）

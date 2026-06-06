@@ -40,12 +40,12 @@
 
 ### 里程碑 M1.3 · 三个 Adapter（2 周）
 
-- [ ] Hermes adapter（最熟，作为 reference 实现）
+- [ ] OpenCode adapter（schema 最干净，作为 reference 实现 — session/message/part/event + parent_id 全直给）
+- [ ] Hermes adapter（spike 已验证 WAL tail 路径，复用代码）
 - [ ] Claude Code adapter
-- [ ] Codex adapter
 - [ ] 每个 adapter 的 fixture + 单元测试
 
-**验收：** daemon 起来，看到 ~/.claude ~/.codex ~/.hermes 的 session 都被发现。
+**验收：** daemon 起来，看到 ~/.local/share/opencode ~/.claude ~/.hermes 的 session 都被发现。
 
 ### 里程碑 M1.4 · 事件流 + SSE（1 周）
 
@@ -97,8 +97,8 @@
 ### 里程碑 M2.2 · Controller 协议（1.5 周）
 
 - [ ] Controller 基类
+- [ ] OpenCode Controller（spawn 模式）
 - [ ] Claude Code Controller（spawn 模式）
-- [ ] Codex Controller（spawn 模式）
 - [ ] Hermes Controller（inject 模式）
 - [ ] 进程生命周期管理（pause/resume/cancel）
 
@@ -168,7 +168,7 @@
 - [ ] Approval / Rule 表（V0.1 已上线 schema）
 - [ ] `/api/approve` 端点
 - [ ] Claude Code PreToolUse hook 脚本
-- [ ] Codex hook 脚本
+- [ ] OpenCode hook 脚本（如其支持；否则走 V0.4 proxy 路径备份）
 
 ### 里程碑 M4.2 · 规则引擎（1.5 周）
 
@@ -210,9 +210,10 @@
 4. **死循环 / 卡死检测** — 主动 alert
 5. **行为模式分析** — 哪类 session 高产出
 6. **多机器同步** — 笔记本 + 台式机
-7. **OpenCode / Pi adapter** — 你也用，但用得少
-8. **CrewAI / LangGraph adapter** — 框架级 agent
-9. **Skills / playbook 沉淀** — 把经验固化
+7. **Codex adapter** — spike 实测 L2 实时最好，演示价值高
+8. **omp adapter** — 半套观测（只有 prompt 历史，无 agent 输出）
+9. **CrewAI / LangGraph adapter** — 框架级 agent
+10. **Skills / playbook 沉淀** — 把经验固化
 
 ---
 
