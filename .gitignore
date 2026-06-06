@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local backups / scratch
+*.bak
+*.bak.*
+/tmp/
+scratch/
+
+# Witness runtime (if we ever add persistence)
+events.db
+events.db-*
+*.log
