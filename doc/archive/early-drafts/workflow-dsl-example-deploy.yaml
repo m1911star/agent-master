@@ -1,0 +1,536 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Example: Deploy Microservice Workflow
+# ═══════════════════════════════════════════════════════════════════════════════
+# A production-grade deployment pipeline demonstrating:
+#   - Parallel test branches with join
+#   - Human approval gates
+#   - Conditional paths (staging vs production)
+#   - Data flow between nodes
+#   - Runtime augmentation (test discovery)
+#   - Subworkflows (rollback)
+#   - Retry policies and timeouts
+
+workflow:
+  id: deploy/microservice
+  name: Deploy Microservice
+  version: "1.2.0"
+  description: |
+    Full CI/CD pipeline for microservice deployment.
+    Builds, tests in parallel, scans for vulnerabilities,
+    deploys to staging with smoke tests, then production with approval.
+  author: platform-team
+  tags: [deploy, ci, microservice, production]
+  origin: defined
+
+  # ── Triggers ──────────────────────────────────────────────────────────────
+  triggers:
+    - type: git_push
+      config:
+        branches: ["main"]
+        paths: ["src/**", "Dockerfile", "package.json"]
+      condition: ${{ trigger.payload.commit_message not matches '^\[skip ci\]' }}
+
+    - type: git_pr
+      config:
+        actions: ["merged"]
+        base_branches: ["main"]
+
+    - type: manual
+      config:
+        inputs:
+          target_env:
+            type: string
+            enum: [staging, production]
+            default: staging
+          skip_tests:
+            type: boolean
+            default: false
+          force_deploy:
+            type: boolean
+            default: false
+
+  # ── Variables ─────────────────────────────────────────────────────────────
+  variables:
+    service_name:
+      type: string
+      required: true
+      description: "Name of the microservice being deployed"
+    image_registry:
+      type: string
+      default: "ghcr.io/witness-platform"
+    cluster:
+      type: string
+      default: "production-us-east-1"
+    namespace:
+      type: string
+      default: "services"
+    target_env:
+      type: string
+      default: "staging"
+      enum: [staging, production]
+    replicas:
+      type: number
+      default: 3
+    deploy_timeout:
+      type: string
+      default: "10m"
+    rollback_on_failure:
+      type: boolean
+      default: true
+
+  # ── Defaults ──────────────────────────────────────────────────────────────
+  defaults:
+    timeout: "30m"
+    retry:
+      max_attempts: 2
+      backoff: exponential
+      delay: "15s"
+      max_delay: "2m"
+    agent:
+      source: claude-code
+      model: claude-sonnet-4-20250514
+      permission_mode: auto
+      max_turns: 30
+      cost_limit_usd: 3.00
+    notification:
+      channels: ["slack:#deployments"]
+
+  # ── Error Handling ────────────────────────────────────────────────────────
+  on_failure:
+    strategy: pause
+    notification:
+      channels: ["slack:#deployments", "pagerduty:deploy-oncall"]
+      message: "🚨 Deploy of {{variables.service_name}} failed at {{failed_node.label}}"
+    cleanup_nodes: [cleanup-resources]
+
+  # ── Concurrency ───────────────────────────────────────────────────────────
+  concurrency:
+    group: "deploy-{{variables.service_name}}"
+    strategy: cancel_previous
+    max_parallel: 1
+
+  # ── Nodes ─────────────────────────────────────────────────────────────────
+  nodes:
+
+    # ═══ STAGE 1: Build ═══════════════════════════════════════════════════════
+    - id: build-image
+      type: agent_task
+      label: "Build Docker Image"
+      description: "Build and push container image to registry"
+      config:
+        prompt: |
+          Build the Docker image for {{variables.service_name}}.
+          - Run `docker build -t {{variables.image_registry}}/{{variables.service_name}}:{{trigger.payload.sha_short}} .`
+          - Push to registry
+          - Output the full image tag and digest
+        workspace:
+          cwd: ${{ trigger.payload.repo_path }}
+          git_branch: ${{ trigger.payload.branch }}
+        tools_allowed: [bash, read]
+        max_turns: 15
+        cost_limit_usd: 1.00
+        artifacts:
+          - path: "build-output.json"
+            name: build_manifest
+      outputs:
+        image_tag:
+          type: string
+          description: "Full image tag: registry/name:sha"
+        image_digest:
+          type: string
+          description: "SHA256 digest of built image"
+        build_duration_s:
+          type: number
+      timeout: "15m"
+      retry:
+        max_attempts: 2
+        retry_on: [timeout, transient]
+
+    # ═══ STAGE 2: Parallel Testing ═══════════════════════════════════════════
+    - id: unit-tests
+      type: agent_task
+      label: "Unit Tests"
+      depends_on: [build-image]
+      conditions:
+        unless: ${{ variables.skip_tests == true }}
+      config:
+        prompt: |
+          Run unit tests for {{variables.service_name}}.
+          Execute: `npm run test:unit -- --coverage --ci`
+          Report coverage percentage and any failures.
+        workspace:
+          cwd: ${{ trigger.payload.repo_path }}
+        tools_allowed: [bash, read]
+        max_turns: 10
+        cost_limit_usd: 1.00
+      outputs:
+        passed:
+          type: boolean
+        coverage_pct:
+          type: number
+        failures:
+          type: array
+      timeout: "10m"
+
+    - id: integration-tests
+      type: agent_task
+      label: "Integration Tests"
+      depends_on: [build-image]
+      conditions:
+        unless: ${{ variables.skip_tests == true }}
+      config:
+        prompt: |
+          Run integration tests against the built image.
+          - Start test dependencies with docker-compose
+          - Run: `npm run test:integration`
+          - Tear down and report results.
+        workspace:
+          cwd: ${{ trigger.payload.repo_path }}
+        tools_allowed: [bash, read]
+        environment:
+          TEST_IMAGE: ${{ nodes.build-image.outputs.image_tag }}
+        max_turns: 20
+        cost_limit_usd: 2.00
+      inputs:
+        image_tag:
+          from: ${{ nodes.build-image.outputs.image_tag }}
+          required: true
+      outputs:
+        passed:
+          type: boolean
+        test_count:
+          type: number
+        failures:
+          type: array
+      timeout: "20m"
+
+    - id: e2e-tests
+      type: agent_task
+      label: "E2E Tests"
+      depends_on: [build-image]
+      conditions:
+        unless: ${{ variables.skip_tests == true }}
+      config:
+        prompt: |
+          Run end-to-end tests for the service.
+          Deploy to ephemeral environment, run playwright/cypress suite.
+          Collect traces on failure.
+        workspace:
+          cwd: ${{ trigger.payload.repo_path }}
+        tools_allowed: [bash, read, web]
+        max_turns: 25
+        cost_limit_usd: 3.00
+      inputs:
+        image_tag:
+          from: ${{ nodes.build-image.outputs.image_tag }}
+          required: true
+      outputs:
+        passed:
+          type: boolean
+        report_url:
+          type: string
+      timeout: "25m"
+      # ── Runtime Augmentation: agent can discover additional test suites ──
+      augmentable: true
+      injection_rules:
+        max_children: 10
+        allowed_types: [agent_task]
+        auto_approve: true
+        cost_budget_usd: 5.00
+        inherit_timeout: true
+
+    # ═══ STAGE 2b: Security ═══════════════════════════════════════════════════
+    - id: security-scan
+      type: agent_task
+      label: "Security Scan"
+      depends_on: [build-image]
+      config:
+        agent_source: claude-code
+        prompt: |
+          Run security scanning on the built image:
+          1. Container vulnerability scan (trivy/grype)
+          2. SAST on source code (semgrep)
+          3. Dependency audit (npm audit / pip audit)
+          4. Secret detection (trufflehog)
+          Report all findings with severity levels.
+        tools_allowed: [bash, read]
+        max_turns: 20
+        cost_limit_usd: 2.00
+      inputs:
+        image_tag:
+          from: ${{ nodes.build-image.outputs.image_tag }}
+      outputs:
+        critical_count:
+          type: number
+        high_count:
+          type: number
+        findings:
+          type: array
+          description: "List of {severity, package, cve, description}"
+        passed:
+          type: boolean
+          description: "true if no critical/high vulnerabilities"
+      timeout: "15m"
+
+    # ═══ STAGE 3: Gate — All Checks Must Pass ═════════════════════════════════
+    - id: quality-gate
+      type: gate
+      label: "Quality Gate"
+      description: "All tests and security scan must pass before deployment"
+      depends_on:
+        - node: unit-tests
+          status: any_terminal       # Allow skipped (when skip_tests=true)
+        - node: integration-tests
+          status: any_terminal
+        - node: e2e-tests
+          status: any_terminal
+        - node: security-scan
+      config:
+        mode: expression
+        expression: |
+          ${{
+            (variables.skip_tests || (
+              nodes.unit-tests.outputs.passed &&
+              nodes.integration-tests.outputs.passed &&
+              nodes.e2e-tests.outputs.passed
+            )) &&
+            (nodes.security-scan.outputs.critical_count == 0) &&
+            (variables.force_deploy || nodes.security-scan.outputs.high_count <= 3)
+          }}
+        outputs_on_pass:
+          ready_to_deploy: true
+          quality_summary: "All checks passed"
+        outputs_on_fail:
+          ready_to_deploy: false
+          quality_summary: "Quality gate failed — check test/security results"
+
+    # ═══ STAGE 4: Deploy to Staging ═══════════════════════════════════════════
+    - id: deploy-staging
+      type: agent_task
+      label: "Deploy to Staging"
+      depends_on: [quality-gate]
+      config:
+        prompt: |
+          Deploy {{variables.service_name}} to staging environment.
+          - Image: {{nodes.build-image.outputs.image_tag}}
+          - Use kubectl/helm to deploy to staging namespace
+          - Wait for rollout to complete
+          - Report the staging URL
+        tools_allowed: [bash, read]
+        environment:
+          KUBECONFIG: ${{ secrets.STAGING_KUBECONFIG }}
+        max_turns: 15
+        cost_limit_usd: 1.50
+      inputs:
+        image_tag:
+          from: ${{ nodes.build-image.outputs.image_tag }}
+          required: true
+      outputs:
+        staging_url:
+          type: string
+        deployment_id:
+          type: string
+        replicas_ready:
+          type: number
+      timeout: "10m"
+      retry:
+        max_attempts: 3
+        backoff: exponential
+        delay: "30s"
+
+    # ═══ STAGE 5: Smoke Tests on Staging ══════════════════════════════════════
+    - id: smoke-tests
+      type: agent_task
+      label: "Staging Smoke Tests"
+      depends_on: [deploy-staging]
+      config:
+        prompt: |
+          Run smoke tests against staging deployment:
+          - Health endpoint: GET {{nodes.deploy-staging.outputs.staging_url}}/health
+          - Key API endpoints functional
+          - Response times within SLA (<500ms p95)
+          - No error spikes in last 2 minutes
+        tools_allowed: [bash, web, read]
+        max_turns: 15
+      inputs:
+        staging_url:
+          from: ${{ nodes.deploy-staging.outputs.staging_url }}
+          required: true
+      outputs:
+        healthy:
+          type: boolean
+        latency_p95_ms:
+          type: number
+        error_rate_pct:
+          type: number
+      timeout: "10m"
+
+    # ═══ STAGE 6: Human Approval for Production ═══════════════════════════════
+    - id: production-approval
+      type: human_checkpoint
+      label: "Production Deploy Approval"
+      depends_on: [smoke-tests]
+      conditions:
+        when: ${{ variables.target_env == 'production' }}
+      config:
+        assignee: deploy-approvers
+        message: |
+          ## Ready to deploy to production
+
+          **Service:** {{variables.service_name}}
+          **Image:** {{nodes.build-image.outputs.image_tag}}
+          **Staging URL:** {{nodes.deploy-staging.outputs.staging_url}}
+
+          ### Quality Summary
+          - Unit test coverage: {{nodes.unit-tests.outputs.coverage_pct}}%
+          - Security findings: {{nodes.security-scan.outputs.high_count}} high, {{nodes.security-scan.outputs.critical_count}} critical
+          - Staging latency p95: {{nodes.smoke-tests.outputs.latency_p95_ms}}ms
+          - Staging error rate: {{nodes.smoke-tests.outputs.error_rate_pct}}%
+        context_nodes: [quality-gate, smoke-tests, security-scan]
+        actions:
+          - id: approve
+            label: "🚀 Deploy to Production"
+            style: primary
+            transitions_to: completed
+            output_value: { approved: true }
+          - id: reject
+            label: "❌ Reject"
+            style: danger
+            requires_comment: true
+            transitions_to: failed
+            output_value: { approved: false }
+          - id: defer
+            label: "⏸️ Deploy Later"
+            style: default
+            transitions_to: skipped
+            output_value: { deferred: true }
+        timeout_action: reject
+        escalation:
+          after: "4h"
+          to: engineering-manager
+        notification:
+          channels: ["slack:#deploy-approvals"]
+          remind_after: "1h"
+      timeout: "24h"
+
+    # ═══ STAGE 7: Production Deploy ═══════════════════════════════════════════
+    - id: deploy-production
+      type: agent_task
+      label: "Deploy to Production"
+      depends_on:
+        - node: production-approval
+          status: completed
+      config:
+        prompt: |
+          Deploy {{variables.service_name}} to production.
+          - Image: {{nodes.build-image.outputs.image_tag}}
+          - Cluster: {{variables.cluster}}
+          - Namespace: {{variables.namespace}}
+          - Replicas: {{variables.replicas}}
+          - Strategy: rolling update (maxSurge=1, maxUnavailable=0)
+          - Wait for all pods healthy
+        tools_allowed: [bash, read]
+        permission_mode: plan    # Extra caution for production
+        environment:
+          KUBECONFIG: ${{ secrets.PRODUCTION_KUBECONFIG }}
+        max_turns: 20
+        cost_limit_usd: 2.00
+      inputs:
+        image_tag:
+          from: ${{ nodes.build-image.outputs.image_tag }}
+          required: true
+      outputs:
+        deployment_id:
+          type: string
+        production_url:
+          type: string
+        rollout_duration_s:
+          type: number
+      timeout: "15m"
+
+    # ═══ STAGE 8: Health Check ════════════════════════════════════════════════
+    - id: health-check
+      type: agent_task
+      label: "Production Health Check"
+      depends_on: [deploy-production]
+      config:
+        prompt: |
+          Verify production deployment health:
+          1. All replicas reporting ready
+          2. Health endpoint returning 200
+          3. Error rate < 0.1% over 3 minutes
+          4. P95 latency < 300ms
+          5. No OOMKills or CrashLoopBackOff
+          Monitor for 5 minutes, then report.
+        tools_allowed: [bash, web, read]
+        max_turns: 10
+      outputs:
+        healthy:
+          type: boolean
+        metrics_snapshot:
+          type: object
+      timeout: "10m"
+      retry:
+        max_attempts: 3
+        delay: "60s"
+        backoff: fixed
+        on_exhaust: fail
+
+    # ═══ STAGE 9: Conditional Rollback ════════════════════════════════════════
+    - id: rollback
+      type: subworkflow
+      label: "Rollback Procedure"
+      depends_on:
+        - node: health-check
+          status: failed
+      conditions:
+        when: ${{ variables.rollback_on_failure == true }}
+      config:
+        workflow_ref: "workflows/rollback-service.yaml"
+        input_mapping:
+          service_name: ${{ variables.service_name }}
+          cluster: ${{ variables.cluster }}
+          namespace: ${{ variables.namespace }}
+          deployment_id: ${{ nodes.deploy-production.outputs.deployment_id }}
+        output_mapping:
+          rolled_back_to: "child.outputs.previous_version"
+          rollback_success: "child.outputs.success"
+        on_failure: fail_parent
+      outputs:
+        rolled_back_to:
+          type: string
+        rollback_success:
+          type: boolean
+      timeout: "10m"
+
+    # ═══ STAGE 10: Success Notification ═══════════════════════════════════════
+    - id: notify-success
+      type: trigger
+      label: "Deployment Success Notification"
+      depends_on:
+        - node: health-check
+          status: completed
+      config:
+        direction: outbound
+        event_type: deployment.completed
+        payload:
+          service: ${{ variables.service_name }}
+          version: ${{ nodes.build-image.outputs.image_tag }}
+          url: ${{ nodes.deploy-production.outputs.production_url }}
+          duration_m: ${{ duration(workflow.started_at, now()) / 60000 }}
+        target: "webhook:${{ secrets.DEPLOY_WEBHOOK_URL }}"
+
+    # ═══ Cleanup (runs on failure) ════════════════════════════════════════════
+    - id: cleanup-resources
+      type: agent_task
+      label: "Cleanup Ephemeral Resources"
+      config:
+        prompt: |
+          Clean up any ephemeral resources from this deploy run:
+          - Remove ephemeral test environments
+          - Clean up docker-compose stacks
+          - Remove temporary credentials
+        tools_allowed: [bash]
+        max_turns: 5
+        cost_limit_usd: 0.50
+      timeout: "5m"

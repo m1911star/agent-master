@@ -1,0 +1,822 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXAMPLE 1: Deploy Workflow Template
+# ═══════════════════════════════════════════════════════════════════════════════
+# A standard deployment pipeline with optional test skip and custom verification.
+
+id: witness.deploy.standard
+version: "1.0.0"
+name: Standard Deploy
+description: |
+  Multi-stage deployment pipeline supporting any environment.
+  Includes checkout, testing, build, deploy, verification, and notification.
+author: witness-team
+tags: [deploy, ci-cd, production]
+category: deployment
+
+parameters:
+  - name: environment
+    type: enum
+    description: Target deployment environment
+    required: true
+    constraints:
+      type: enum
+      values:
+        - { value: staging, label: Staging }
+        - { value: production, label: Production }
+        - { value: canary, label: Canary (10%) }
+    ui: { widget: select, order: 1 }
+
+  - name: branch
+    type: string
+    description: Git branch to deploy from
+    required: false
+    default: main
+    constraints: { type: string, pattern: "^[a-zA-Z0-9/_.-]+$" }
+
+  - name: skipTests
+    type: boolean
+    description: Skip test suite (emergency deploys only)
+    required: false
+    default: false
+    ui: { widget: toggle, group: advanced }
+
+  - name: notifyChannel
+    type: string
+    description: Notification channel for deploy status
+    required: false
+    default: "#deploys"
+
+  - name: rollbackOnFailure
+    type: boolean
+    description: Auto-rollback if verification fails
+    required: false
+    default: true
+
+nodes:
+  - id: checkout
+    kind: fixed
+    name: Checkout & Prepare
+    action:
+      type: shell
+      command: "git checkout $params.branch && git pull origin $params.branch"
+    outputs:
+      - { name: commitSha, type: string }
+      - { name: commitMessage, type: string }
+    timeout: "2m"
+
+  - id: test
+    kind: optional
+    name: Run Test Suite
+    condition: "$params.skipTests !== true"
+    action:
+      type: agent_task
+      prompt: "Run the full test suite and report results. Fail if any tests fail."
+      tools: [shell, file_read]
+    outputs:
+      - { name: testsPassed, type: number }
+      - { name: testsFailed, type: number }
+      - { name: coverage, type: number }
+    timeout: "15m"
+    retry: { maxAttempts: 2, backoff: fixed, delay: "30s" }
+
+  - id: build
+    kind: fixed
+    name: Build Artifacts
+    action:
+      type: shell
+      command: "make build ENV=$params.environment"
+    outputs:
+      - { name: artifactPath, type: string }
+      - { name: artifactSize, type: number }
+    timeout: "10m"
+
+  - id: approval_gate
+    kind: gate
+    name: Deploy Approval
+    gateType: approval
+    approvers: [user, auto]
+    # Auto-approve for staging, require human for production
+    condition: "$params.environment === 'staging'"
+
+  - id: deploy
+    kind: fixed
+    name: Deploy to Environment
+    action:
+      type: agent_task
+      prompt: |
+        Deploy the built artifacts to $params.environment.
+        Use the appropriate deployment strategy for this environment.
+        Artifact path: $nodes.build.outputs.artifactPath
+      tools: [shell, api_call]
+    timeout: "10m"
+
+  - id: verify
+    kind: placeholder
+    name: Verify Deployment
+    slotId: verification_logic
+    timeout: "5m"
+
+  - id: notify
+    kind: fixed
+    name: Send Notifications
+    action:
+      type: notification
+      channel: "$params.notifyChannel"
+      message: |
+        Deploy to $params.environment complete.
+        Commit: $nodes.checkout.outputs.commitSha
+        Status: $workflow.status
+
+slots:
+  - id: verification_logic
+    name: Custom Verification
+    description: |
+      Agent fills in environment-specific verification steps.
+      Could be health checks, smoke tests, or integration validation.
+    expectedShape: { kind: node_sequence, minNodes: 1, maxNodes: 5 }
+    constraints:
+      requiredTools: [shell, web]
+      maxDuration: "5m"
+      requiredOutputs:
+        - { name: healthy, type: boolean }
+        - { name: details, type: string }
+    fallback:
+      strategy: timeout
+      duration: "5m"
+      then: { strategy: default_node, nodeId: default_health_check }
+    allowSubdivision: true
+    maxSubNodes: 5
+
+edges:
+  - { from: __start__, to: checkout }
+  - { from: checkout, to: test }
+  - { from: checkout, to: build, condition: "$params.skipTests === true" }
+  - { from: test, to: build }
+  - { from: build, to: approval_gate }
+  - { from: approval_gate, to: deploy }
+  - { from: deploy, to: verify }
+  - { from: verify, to: notify }
+  - { from: notify, to: __end__ }
+
+includes: []
+
+triggers:
+  - id: deploy-on-tag
+    type: git_event
+    enabled: true
+    events: [tag_created]
+    branchPattern: "v*"
+    conditions:
+      - type: state
+        constraint: { kind: no_active_workflow, templateId: witness.deploy.standard }
+
+  - id: deploy-manual
+    type: manual
+    enabled: true
+    buttonLabel: "Deploy Now"
+    confirmMessage: "Are you sure you want to deploy to $params.environment?"
+
+  - id: deploy-api
+    type: api_call
+    enabled: true
+    endpoint: /api/v1/deploy
+    method: POST
+    auth: token
+
+hooks:
+  onStart:
+    - type: notify
+      channel: "$params.notifyChannel"
+      message: "🚀 Deploy started: $params.branch → $params.environment"
+  onError:
+    - type: notify
+      channel: "$params.notifyChannel"
+      message: "❌ Deploy failed: $workflow.error"
+  onComplete:
+    - type: metric
+      name: deploy.duration
+      value: "$workflow.durationMs"
+
+metadata:
+  estimatedDuration: "30m"
+  complexity: moderate
+  applicableWhen:
+    - "Agent is deploying code to an environment"
+    - "Git tag was pushed"
+  keywords: [deploy, release, ship, rollout]
+
+---
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXAMPLE 2: Code Review Workflow Template
+# ═══════════════════════════════════════════════════════════════════════════════
+# Automated code review with composable test suite and AI review agent.
+
+id: witness.review.standard
+version: "1.0.0"
+name: Code Review Pipeline
+description: |
+  Comprehensive code review workflow combining static analysis, testing,
+  security scanning, and AI-assisted review. Composes with a test-suite template.
+author: witness-team
+tags: [review, quality, ci, security]
+category: quality
+
+parameters:
+  - name: reviewers
+    type: array
+    description: List of reviewer agent sources or user IDs
+    required: false
+    default: [claude-code]
+    constraints: { type: array, itemType: string, minItems: 1, maxItems: 5 }
+
+  - name: autoApproveThreshold
+    type: number
+    description: Score (0-100) above which auto-approval is granted
+    required: false
+    default: 90
+    constraints: { type: number, min: 0, max: 100 }
+
+  - name: requireTests
+    type: boolean
+    description: Whether passing tests are required for approval
+    required: false
+    default: true
+
+  - name: securityLevel
+    type: enum
+    description: Security scanning intensity
+    required: false
+    default: standard
+    constraints:
+      type: enum
+      values:
+        - { value: minimal, label: Quick scan }
+        - { value: standard, label: Standard }
+        - { value: thorough, label: Deep analysis }
+
+  - name: targetBranch
+    type: string
+    description: Branch being reviewed (PR source branch)
+    required: true
+
+  - name: baseBranch
+    type: string
+    description: Base branch (PR target)
+    required: false
+    default: main
+
+nodes:
+  - id: diff_analysis
+    kind: fixed
+    name: Analyze Diff
+    action:
+      type: shell
+      command: "git diff $params.baseBranch...$params.targetBranch --stat"
+    outputs:
+      - { name: filesChanged, type: number }
+      - { name: linesAdded, type: number }
+      - { name: linesRemoved, type: number }
+      - { name: changedPaths, type: array }
+    timeout: "1m"
+
+  - id: lint
+    kind: fixed
+    name: Lint & Format Check
+    action:
+      type: agent_task
+      prompt: |
+        Run linters on the changed files: $nodes.diff_analysis.outputs.changedPaths
+        Report any violations with file, line, and severity.
+      tools: [shell, file_read]
+    outputs:
+      - { name: violations, type: array }
+      - { name: autoFixable, type: number }
+    timeout: "5m"
+
+  - id: test_suite
+    kind: subworkflow
+    name: Test Suite
+    templateRef: { id: witness.test.suite, version: ">=1.0.0" }
+    paramBindings:
+      targetPaths: "$nodes.diff_analysis.outputs.changedPaths"
+      coverage: "true"
+      parallel: "true"
+
+  - id: security_scan
+    kind: optional
+    name: Security Scan
+    condition: "$params.securityLevel !== 'minimal'"
+    action:
+      type: agent_task
+      prompt: |
+        Perform security analysis at $params.securityLevel level.
+        Focus on: dependency vulnerabilities, injection risks, secret leaks,
+        and unsafe patterns in changed files.
+      tools: [shell, file_read, search]
+    outputs:
+      - { name: vulnerabilities, type: array }
+      - { name: riskScore, type: number }
+    timeout: "10m"
+
+  - id: review_agent
+    kind: placeholder
+    name: AI Code Review
+    slotId: review_criteria
+    timeout: "10m"
+
+  - id: scoring_gate
+    kind: gate
+    name: Quality Gate
+    gateType: collect
+    collect:
+      - lint.violations
+      - test_suite.testResults
+      - security_scan.vulnerabilities
+      - review_agent.score
+    config:
+      # Auto-approve if score exceeds threshold and no critical issues
+      autoApprove: "$collected.review_agent.score >= $params.autoApproveThreshold && $collected.security_scan.riskScore < 30"
+
+  - id: decision
+    kind: gate
+    name: Final Decision
+    gateType: approval
+    approvers: [user, auto]
+    condition: "$nodes.scoring_gate.outputs.autoApprove === true"
+
+slots:
+  - id: review_criteria
+    name: Review Criteria
+    description: |
+      Custom review logic. The agent should evaluate code quality,
+      architecture, naming, documentation, and adherence to conventions.
+      Must produce a numeric score and detailed findings.
+    expectedShape: { kind: single_node }
+    constraints:
+      requiredTools: [file_read, search]
+      maxDuration: "10m"
+      requiredOutputs:
+        - { name: score, type: number }
+        - { name: findings, type: array }
+        - { name: summary, type: string }
+    fallback:
+      strategy: default_node
+      nodeId: basic_review
+    allowSubdivision: false
+
+edges:
+  - { from: __start__, to: diff_analysis }
+  - { from: diff_analysis, to: lint }
+  - { from: diff_analysis, to: test_suite }
+  - { from: diff_analysis, to: security_scan }
+  - { from: diff_analysis, to: review_agent }
+  # All parallel tracks converge at scoring gate
+  - { from: lint, to: scoring_gate }
+  - { from: test_suite, to: scoring_gate }
+  - { from: security_scan, to: scoring_gate }
+  - { from: review_agent, to: scoring_gate }
+  - { from: scoring_gate, to: decision }
+  - { from: decision, to: __end__ }
+
+includes:
+  - templateId: witness.test.suite
+    version: ">=1.0.0"
+    as: test_suite
+    paramBindings:
+      targetPaths: "$nodes.diff_analysis.outputs.changedPaths"
+      coverage: "true"
+
+triggers:
+  - id: review-on-pr
+    type: git_event
+    enabled: true
+    events: [pull_request_opened]
+    conditions:
+      - type: predicate
+        field: event.data.draft
+        operator: neq
+        value: true
+
+  - id: review-on-file-change
+    type: file_change
+    enabled: true
+    patterns: ["src/**/*.ts", "src/**/*.tsx", "lib/**/*.py"]
+    exclude: ["**/*.test.*", "**/*.spec.*"]
+    events: [modify, create]
+    batchWindow: "10s"
+    conditions:
+      - type: state
+        constraint: { kind: no_active_workflow, templateId: witness.review.standard }
+
+hooks:
+  onComplete:
+    - type: notify
+      channel: "#reviews"
+      message: "Review complete for $params.targetBranch: score $nodes.scoring_gate.outputs.score"
+
+metadata:
+  estimatedDuration: "15m"
+  complexity: moderate
+  applicableWhen:
+    - "Pull request opened"
+    - "Agent is reviewing code changes"
+    - "Files changed in src/ directory"
+  keywords: [review, pr, quality, lint, security]
+
+---
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXAMPLE 3: Debug and Fix Workflow Template
+# ═══════════════════════════════════════════════════════════════════════════════
+# Autonomous debugging workflow with multiple agent slots and inheritance.
+
+id: witness.debug.fix
+version: "1.0.0"
+name: Debug and Fix
+description: |
+  Autonomous debugging workflow: detect error → reproduce → diagnose → fix → verify.
+  Extends the base 'investigate' template with fix and verification phases.
+  Agents fill slots for diagnosis strategy and fix approach.
+author: witness-team
+tags: [debug, fix, autonomous, error-handling]
+category: debugging
+
+# Inheritance: extends a base investigation template
+extends:
+  templateId: witness.investigate.base
+  version: ">=1.0.0"
+
+parameters:
+  - name: errorPattern
+    type: string
+    description: Regex or string pattern that identifies the error
+    required: true
+    constraints: { type: string, minLength: 1, maxLength: 500 }
+
+  - name: maxAttempts
+    type: number
+    description: Maximum fix attempts before escalation
+    required: false
+    default: 3
+    constraints: { type: number, min: 1, max: 10 }
+
+  - name: escalationPolicy
+    type: enum
+    description: What to do when max attempts exhausted
+    required: false
+    default: notify_user
+    constraints:
+      type: enum
+      values:
+        - { value: notify_user, label: Notify user and pause }
+        - { value: revert, label: Revert changes and notify }
+        - { value: create_issue, label: Create issue with findings }
+
+  - name: scope
+    type: enum
+    description: How broadly to search for the root cause
+    required: false
+    default: local
+    constraints:
+      type: enum
+      values:
+        - { value: local, label: Same file/module }
+        - { value: package, label: Same package }
+        - { value: workspace, label: Entire workspace }
+
+  - name: preserveChanges
+    type: boolean
+    description: Keep intermediate fix attempts in git stash
+    required: false
+    default: true
+
+nodes:
+  - id: detect_error
+    kind: fixed
+    name: Detect & Capture Error
+    action:
+      type: agent_task
+      prompt: |
+        Locate and capture the error matching pattern: $params.errorPattern
+        Collect: full stack trace, relevant log context, reproduction conditions.
+        Search scope: $params.scope
+      tools: [shell, file_read, search]
+    outputs:
+      - { name: errorMessage, type: string }
+      - { name: stackTrace, type: string }
+      - { name: sourceFile, type: string }
+      - { name: sourceLine, type: number }
+      - { name: context, type: object }
+    timeout: "3m"
+
+  - id: reproduce
+    kind: fixed
+    name: Reproduce Error
+    action:
+      type: agent_task
+      prompt: |
+        Create a minimal reproduction of the error.
+        Error: $nodes.detect_error.outputs.errorMessage
+        File: $nodes.detect_error.outputs.sourceFile:$nodes.detect_error.outputs.sourceLine
+        Write a test or command that reliably triggers this error.
+      tools: [shell, file_read, file_edit]
+    outputs:
+      - { name: reproCommand, type: string }
+      - { name: reproReliable, type: boolean }
+      - { name: reproFile, type: string }
+    timeout: "5m"
+    retry: { maxAttempts: 2, backoff: fixed, delay: "10s" }
+
+  - id: diagnose
+    kind: placeholder
+    name: Diagnose Root Cause
+    slotId: diagnosis_strategy
+    timeout: "10m"
+
+  - id: fix
+    kind: placeholder
+    name: Implement Fix
+    slotId: fix_approach
+    timeout: "15m"
+
+  - id: verify_fix
+    kind: fixed
+    name: Verify Fix
+    action:
+      type: agent_task
+      prompt: |
+        Verify that the fix resolves the original error:
+        1. Run the reproduction: $nodes.reproduce.outputs.reproCommand
+        2. Confirm the error no longer occurs
+        3. Run related tests to check for regressions
+        4. Verify the fix doesn't introduce new issues
+      tools: [shell, file_read, search]
+    outputs:
+      - { name: fixed, type: boolean }
+      - { name: regressions, type: array }
+      - { name: testResults, type: object }
+    timeout: "10m"
+
+  - id: retry_gate
+    kind: gate
+    name: Retry Decision
+    gateType: condition
+    condition: "$nodes.verify_fix.outputs.fixed === false && $workflow.attemptCount < $params.maxAttempts"
+    # If condition true: loop back to diagnose. If false: escalate or succeed.
+
+  - id: report
+    kind: fixed
+    name: Generate Report
+    action:
+      type: agent_task
+      prompt: |
+        Generate a debugging report with:
+        - Original error and reproduction steps
+        - Diagnosis findings: $nodes.diagnose.outputs
+        - Fix applied: $nodes.fix.outputs
+        - Verification results: $nodes.verify_fix.outputs
+        - Recommendations for preventing similar issues
+      tools: [file_edit]
+    outputs:
+      - { name: reportPath, type: string }
+      - { name: summary, type: string }
+    timeout: "3m"
+
+  - id: escalate
+    kind: optional
+    name: Escalate
+    condition: "$nodes.verify_fix.outputs.fixed === false"
+    action:
+      type: notification
+      channel: "#engineering"
+      message: |
+        🔴 Auto-fix failed after $params.maxAttempts attempts.
+        Error: $nodes.detect_error.outputs.errorMessage
+        Policy: $params.escalationPolicy
+        Report: $nodes.report.outputs.reportPath
+
+slots:
+  - id: diagnosis_strategy
+    name: Diagnosis Strategy
+    description: |
+      Agent chooses how to diagnose the root cause. Options include:
+      - Static analysis (trace code paths)
+      - Dynamic analysis (add logging, use debugger)
+      - Bisection (git bisect to find introducing commit)
+      - Dependency analysis (check for version conflicts)
+      Agent may combine strategies or subdivide into steps.
+    expectedShape: { kind: node_sequence, minNodes: 1, maxNodes: 4 }
+    constraints:
+      requiredTools: [shell, file_read, search]
+      maxDuration: "10m"
+      requiredOutputs:
+        - { name: rootCause, type: string }
+        - { name: confidence, type: number }
+        - { name: affectedFiles, type: array }
+    fallback:
+      strategy: timeout
+      duration: "10m"
+      then: { strategy: escalate, to: user }
+    allowSubdivision: true
+    maxSubNodes: 4
+
+  - id: fix_approach
+    name: Fix Implementation
+    description: |
+      Agent implements the actual fix based on diagnosis.
+      Must produce a working code change that addresses the root cause.
+      Should be minimal and focused — no refactoring beyond what's needed.
+    expectedShape: { kind: single_node }
+    constraints:
+      requiredTools: [file_edit, shell]
+      maxDuration: "15m"
+      requiredOutputs:
+        - { name: filesModified, type: array }
+        - { name: approach, type: string }
+        - { name: riskLevel, type: enum }
+    fallback:
+      strategy: escalate
+      to: user
+    allowSubdivision: true
+    maxSubNodes: 3
+
+edges:
+  - { from: __start__, to: detect_error }
+  - { from: detect_error, to: reproduce }
+  - { from: reproduce, to: diagnose }
+  - { from: diagnose, to: fix }
+  - { from: fix, to: verify_fix }
+  - { from: verify_fix, to: retry_gate }
+  # Retry loop: go back to diagnose with new context
+  - { from: retry_gate, to: diagnose, condition: "$gate.result === true" }
+  # Success or exhausted: proceed to report
+  - { from: retry_gate, to: report, condition: "$gate.result === false" }
+  - { from: report, to: escalate }
+  - { from: report, to: __end__, condition: "$nodes.verify_fix.outputs.fixed === true" }
+  - { from: escalate, to: __end__ }
+
+includes: []
+
+# Override the base investigate template's "collect_evidence" node
+overrides:
+  - target: node
+    nodeId: collect_evidence  # from witness.investigate.base
+    replace:
+      name: "Detect & Capture Error"
+      action:
+        type: agent_task
+        prompt: "Capture error matching: $params.errorPattern"
+
+  - target: add_node
+    node:
+      id: stash_changes
+      kind: optional
+      name: Stash Intermediate Changes
+      condition: "$params.preserveChanges === true"
+      action:
+        type: shell
+        command: "git stash push -m 'debug-fix-attempt-$workflow.attemptCount'"
+    after: verify_fix
+
+triggers:
+  - id: debug-on-agent-error
+    type: agent_event
+    enabled: true
+    eventKinds: [run_failed, tool_failed, error_detected]
+    conditions:
+      - type: predicate
+        field: event.data.errorMessage
+        operator: matches
+        value: "$params.errorPattern"
+      - type: state
+        constraint: { kind: no_active_workflow, templateId: witness.debug.fix }
+
+  - id: debug-on-test-failure
+    type: agent_event
+    enabled: true
+    eventKinds: [tool_failed]
+    toolFilter: [shell, Bash]
+    conditions:
+      - type: predicate
+        field: event.data.output
+        operator: contains
+        value: "FAIL"
+      - type: temporal
+        constraint: { kind: after_delay, duration: "5s" }  # avoid transient failures
+
+  - id: debug-on-log-pattern
+    type: file_change
+    enabled: true
+    patterns: ["*.log", "logs/**"]
+    events: [modify]
+    batchWindow: "5s"
+    conditions:
+      - type: expression
+        expr: "fileContent.match(params.errorPattern) !== null"
+
+  - id: debug-manual
+    type: manual
+    enabled: true
+    buttonLabel: "Debug This Error"
+    requiredInputs:
+      - name: errorPattern
+        type: string
+        description: Error pattern to investigate
+        required: true
+
+hooks:
+  onStart:
+    - type: log
+      level: info
+      message: "Starting debug-and-fix for: $params.errorPattern"
+  onNodeComplete:
+    - nodeId: verify_fix
+      type: metric
+      name: debug.attempts
+      value: "$workflow.attemptCount"
+  onError:
+    - type: notify
+      channel: "#engineering"
+      message: "Debug workflow errored: $workflow.error"
+  onComplete:
+    - type: metric
+      name: debug.duration
+      value: "$workflow.durationMs"
+    - type: metric
+      name: debug.success
+      value: "$nodes.verify_fix.outputs.fixed ? 1 : 0"
+
+metadata:
+  estimatedDuration: "45m"
+  complexity: complex
+  applicableWhen:
+    - "Agent encounters a recurring error"
+    - "Test suite starts failing"
+    - "Error pattern detected in logs"
+    - "User reports a bug to investigate"
+  keywords: [debug, fix, error, bug, diagnose, root-cause, bisect]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXAMPLE TRIGGER DEFINITIONS (standalone)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+---
+# Composite trigger: deploy only when tests pass AND it's business hours
+id: safe-deploy-trigger
+type: composite
+enabled: true
+operator: and
+triggers:
+  - id: tag-push
+    type: git_event
+    enabled: true
+    events: [tag_created]
+    branchPattern: "release/*"
+  - id: business-hours
+    type: schedule
+    enabled: true
+    # Not a real schedule — used as a condition within composite
+    cron: null  # evaluated as time-of-day condition
+    conditions:
+      - type: temporal
+        constraint: { kind: time_of_day, start: "09:00", end: "17:00" }
+      - type: temporal
+        constraint: { kind: day_of_week, days: [1, 2, 3, 4, 5] }
+
+---
+# Sequence trigger: file change THEN test failure within 2 minutes
+id: change-broke-tests
+type: composite
+enabled: true
+operator: sequence
+sequenceWindow: "2m"
+triggers:
+  - id: src-change
+    type: file_change
+    enabled: true
+    patterns: ["src/**"]
+    events: [modify]
+  - id: test-fail
+    type: agent_event
+    enabled: true
+    eventKinds: [tool_failed]
+    toolFilter: [Bash]
+    conditions:
+      - type: predicate
+        field: event.data.output
+        operator: contains
+        value: "FAIL"
+
+---
+# Cost threshold trigger: alert when agent spending exceeds budget
+id: cost-alert
+type: agent_event
+enabled: true
+eventKinds: [cost_threshold]
+conditions:
+  - type: predicate
+    field: event.data.estimatedCostUsd
+    operator: gte
+    value: 5.00
+  - type: state
+    constraint: { kind: agent_idle, duration: "0s" }  # only while running

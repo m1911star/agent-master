@@ -1,0 +1,506 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Witness Workflow DSL — Runtime Augmentation Protocol
+# ═══════════════════════════════════════════════════════════════════════════════
+# How agents dynamically extend running workflows with discovered subtasks.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 1. CONCEPT                                                                  │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# Runtime Augmentation allows agents to inject new nodes into a running workflow
+# DAG when they discover subtasks that weren't known at definition time.
+#
+# Example: A "Run Tests" node starts executing. The agent discovers 12 test
+# suites across the project. It injects 12 child nodes (one per suite) that
+# run in parallel, then the parent join waits for all children.
+#
+# Three workflow modes:
+#   1. STATIC    — Fully defined in YAML. No augmentation possible.
+#   2. DETECTED  — Entirely inferred from observed AgentRun topology at runtime.
+#   3. HYBRID    — YAML template with augmentable nodes that agents fill in.
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 2. YAML SYNTAX FOR AUGMENTATION POINTS                                     │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# ── Minimal augmentable node ──────────────────────────────────────────────────
+# Mark a node as expandable:
+#
+#   - id: discover-tests
+#     type: agent_task
+#     label: "Discover & Run Tests"
+#     augmentable: true                    # <-- enables runtime injection
+#     injection_rules:
+#       max_children: 20                   # Max nodes that can be injected
+#       allowed_types: [agent_task]        # Only agent tasks allowed
+#       auto_approve: true                 # No human gate needed
+#       cost_budget_usd: 10.00             # Total cost cap for all children
+#
+# ── Full injection_rules specification ────────────────────────────────────────
+#
+#   injection_rules:
+#     max_children: integer                # Hard cap on injected nodes (required)
+#     allowed_types:                       # Node types permitted (required)
+#       - agent_task
+#       - gate
+#       - wait
+#     auto_approve: boolean                # If false, injections are held for approval
+#     requires_approval_from: string       # Who approves: username or node_id
+#     allowed_sources: [string]            # Which agent sources can inject
+#     cost_budget_usd: number              # Cumulative cost limit for children
+#     inherit_timeout: boolean             # Children inherit parent's remaining timeout
+#     inherit_config: boolean              # Children inherit parent's agent config
+#     naming_pattern: string               # ID pattern: "test-suite-{index}"
+#     join_mode: enum                      # How parent waits: 'all' | 'any' | 'n_of_m'
+#     join_n: integer                      # For n_of_m: minimum required completions
+#     on_child_failure: enum               # 'fail_parent' | 'continue' | 'skip_remaining'
+#     propagate_outputs: boolean           # Merge child outputs into parent outputs
+#     output_merge_strategy: enum          # 'array' | 'object' | 'last_wins'
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 3. AUGMENTATION PROTOCOL (API)                                              │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# ── FastAPI Endpoint: Inject Nodes ────────────────────────────────────────────
+#
+# POST /api/v1/workflows/{workflow_instance_id}/nodes/{parent_node_id}/augment
+#
+# Request Body (JSON, maps to AugmentationRequest):
+# ```json
+# {
+#   "nodes": [
+#     {
+#       "id": "test-suite-auth",
+#       "type": "agent_task",
+#       "label": "Auth Test Suite",
+#       "config": {
+#         "prompt": "Run auth test suite: pytest tests/auth/ -v",
+#         "tools_allowed": ["bash", "read"],
+#         "max_turns": 10,
+#         "cost_limit_usd": 1.00
+#       },
+#       "outputs": {
+#         "passed": { "type": "boolean" },
+#         "test_count": { "type": "number" }
+#       },
+#       "timeout": "10m"
+#     },
+#     {
+#       "id": "test-suite-payments",
+#       "type": "agent_task",
+#       "label": "Payments Test Suite",
+#       "config": {
+#         "prompt": "Run payments tests: pytest tests/payments/ -v",
+#         "tools_allowed": ["bash", "read"],
+#         "max_turns": 10,
+#         "cost_limit_usd": 1.00
+#       }
+#     }
+#   ],
+#   "edges": [
+#     {
+#       "from": "test-suite-auth",
+#       "to": "test-suite-payments",
+#       "type": "depends_on"
+#     }
+#   ],
+#   "reason": "Discovered 2 test suites in project structure",
+#   "source_run_id": "claude-code:session-abc123"
+# }
+# ```
+#
+# Response (201 Created):
+# ```json
+# {
+#   "augmentation_id": "aug_7f3k2m",
+#   "status": "applied",           // or "pending_approval"
+#   "nodes_added": ["test-suite-auth", "test-suite-payments"],
+#   "edges_added": [{"from": "test-suite-auth", "to": "test-suite-payments"}],
+#   "remaining_budget_usd": 8.00,
+#   "remaining_slots": 18
+# }
+# ```
+#
+# ── FastAPI Endpoint: Query Augmentations ─────────────────────────────────────
+#
+# GET /api/v1/workflows/{workflow_instance_id}/augmentations
+#
+# Response: list of all augmentations applied to this instance, with metadata.
+#
+# ── FastAPI Endpoint: Approve Pending Augmentation ────────────────────────────
+#
+# POST /api/v1/workflows/{workflow_instance_id}/augmentations/{aug_id}/approve
+# POST /api/v1/workflows/{workflow_instance_id}/augmentations/{aug_id}/reject
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 4. TYPESCRIPT INTERFACES                                                    │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# ```typescript
+# // ── Augmentation Request ────────────────────────────────────────────────────
+# export interface AugmentationRequest {
+#   nodes: AugmentedNodeDef[];
+#   edges?: AugmentedEdge[];
+#   reason: string;                        // Why the agent is augmenting
+#   source_run_id: string;                 // AgentRun.id of the requesting agent
+# }
+#
+# export interface AugmentedNodeDef {
+#   id: string;                            // Must be unique within workflow
+#   type: 'agent_task' | 'gate' | 'wait'; // Constrained by injection_rules.allowed_types
+#   label: string;
+#   description?: string;
+#   config: Record<string, unknown>;       // Type-specific config (same as static nodes)
+#   inputs?: Record<string, { from: string; default?: unknown }>;
+#   outputs?: Record<string, { type: string; description?: string }>;
+#   timeout?: string;                      // Duration string
+#   conditions?: { when?: string; unless?: string };
+#   priority?: 'critical' | 'high' | 'normal' | 'low';
+# }
+#
+# export interface AugmentedEdge {
+#   from: string;                          // Source node id (can be existing or newly added)
+#   to: string;                            // Target node id
+#   type: 'depends_on' | 'data_flow';
+#   config?: { join?: 'all' | 'any'; output?: string };
+# }
+#
+# // ── Augmentation Response ───────────────────────────────────────────────────
+# export interface AugmentationResponse {
+#   augmentation_id: string;
+#   status: 'applied' | 'pending_approval' | 'rejected' | 'budget_exceeded';
+#   nodes_added: string[];
+#   edges_added: AugmentedEdge[];
+#   remaining_budget_usd: number;
+#   remaining_slots: number;
+#   rejection_reason?: string;
+# }
+#
+# // ── Augmentation Event (for real-time streaming) ────────────────────────────
+# export interface AugmentationEvent {
+#   kind: 'workflow_augmented';
+#   workflow_instance_id: string;
+#   augmentation_id: string;
+#   parent_node_id: string;
+#   action: 'nodes_injected' | 'pending_approval' | 'approved' | 'rejected';
+#   nodes: AugmentedNodeDef[];
+#   edges: AugmentedEdge[];
+#   source_run_id: string;
+#   timestamp: number;
+# }
+#
+# // ── Augmented Node (runtime state, extends static node) ─────────────────────
+# export interface AugmentedNode {
+#   // All fields from static WorkflowNode, plus:
+#   augmented: true;                       // Flag for UI differentiation
+#   augmentation_id: string;               // Which augmentation created this
+#   parent_node_id: string;                // The expandable node this belongs to
+#   injected_at: number;                   // Timestamp of injection
+#   injected_by: string;                   // AgentRun.id that requested injection
+# }
+# ```
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 5. THREE WORKFLOW MODES                                                     │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# ══ MODE 1: STATIC ════════════════════════════════════════════════════════════
+# Fully defined in YAML. No augmentation. What you write is what runs.
+#
+# workflow:
+#   id: static/simple-build
+#   origin: defined
+#   nodes:
+#     - id: build
+#       type: agent_task
+#       augmentable: false          # (default; explicit for clarity)
+#       ...
+#     - id: test
+#       type: agent_task
+#       depends_on: [build]
+#       ...
+#     - id: deploy
+#       type: agent_task
+#       depends_on: [test]
+#       ...
+
+# ══ MODE 2: DETECTED ═════════════════════════════════════════════════════════
+# No YAML definition exists. Workflow structure is inferred from observed
+# AgentRun topology (TopologyEdge records).
+#
+# When the system observes:
+#   - AgentRun A (root, spawnKind: 'root')
+#   - AgentRun B (parentRunId: A, spawnKind: 'subagent', spawnReason: 'Task')
+#   - AgentRun C (parentRunId: A, spawnKind: 'subagent', spawnReason: 'Task')
+#   - AgentRun D (parentRunId: B, spawnKind: 'subagent', spawnReason: 'Task')
+#
+# It generates a detected workflow:
+#
+# workflow:
+#   id: "detected:claude-code:session-xyz"    # Auto-generated from root run
+#   name: "Agent Session xyz"                  # From AgentRun.title or auto
+#   origin: detected
+#   detected_from:
+#     root_run_id: "claude-code:session-xyz"
+#     source: claude-code
+#     observed_at: 1717689600000
+#   nodes:
+#     - id: "run:claude-code:session-xyz"
+#       type: agent_task
+#       label: "Root Task"
+#       bound_run:
+#         run_id: "claude-code:session-xyz"
+#       # Auto-populated from AgentRun:
+#       status: completed                      # Mapped from RunStatus
+#       started_at: 1717689600000
+#       ended_at: 1717689900000
+#     - id: "run:claude-code:session-abc"
+#       type: agent_task
+#       label: "Subagent: Build"
+#       depends_on: ["run:claude-code:session-xyz"]
+#       bound_run:
+#         run_id: "claude-code:session-abc"
+#     - id: "run:claude-code:session-def"
+#       type: agent_task
+#       label: "Subagent: Test"
+#       depends_on: ["run:claude-code:session-xyz"]
+#       bound_run:
+#         run_id: "claude-code:session-def"
+#     - id: "run:claude-code:session-ghi"
+#       type: agent_task
+#       label: "Sub-subagent: Unit Tests"
+#       depends_on: ["run:claude-code:session-abc"]
+#       bound_run:
+#         run_id: "claude-code:session-ghi"
+#
+# The detected workflow is READ-ONLY (reflects reality, not intent) but can be:
+#   - Labeled by user (add names, descriptions)
+#   - Saved as a template (convert to hybrid for future use)
+#   - Compared to a defined workflow (drift detection)
+
+# ══ MODE 3: HYBRID ═══════════════════════════════════════════════════════════
+# YAML template with augmentation points. Agent fills in details at runtime.
+#
+# workflow:
+#   id: hybrid/test-and-deploy
+#   origin: hybrid
+#   nodes:
+#     - id: discover-tasks
+#       type: agent_task
+#       label: "Discover Work Items"
+#       config:
+#         prompt: "Analyze the repo and identify all tasks needed"
+#       # This node's purpose is to figure out what to do, then augment:
+#       augmentable: true
+#       injection_rules:
+#         max_children: 30
+#         allowed_types: [agent_task, subworkflow]
+#         auto_approve: true
+#         cost_budget_usd: 50.00
+#         join_mode: all
+#         on_child_failure: continue
+#         propagate_outputs: true
+#         output_merge_strategy: array
+#
+#     - id: quality-gate
+#       type: gate
+#       label: "All Tasks Complete"
+#       depends_on:
+#         - node: discover-tasks
+#           status: completed              # Waits for parent + all injected children
+#       config:
+#         mode: expression
+#         expression: ${{ nodes.discover-tasks.outputs.all_passed }}
+#
+#     - id: deploy
+#       type: agent_task
+#       depends_on: [quality-gate]
+#       label: "Deploy"
+#       config:
+#         prompt: "Deploy the verified changes"
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 6. CONFLICT RESOLUTION                                                      │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ── Circular Dependency Detection ─────────────────────────────────────────────
+# Before applying any augmentation, the engine performs a topological sort on
+# the proposed DAG (existing nodes + new nodes + new edges). If a cycle is
+# detected, the augmentation is rejected with:
+#   { status: "rejected", rejection_reason: "circular_dependency: A→B→C→A" }
+#
+# ── Conflicting Edges ─────────────────────────────────────────────────────────
+# If an injected node declares depends_on a node that has already completed:
+#   - If the dependency completed successfully: injected node starts immediately
+#   - If the dependency failed/was skipped: injected node inherits that status
+#
+# ── Concurrent Augmentation ───────────────────────────────────────────────────
+# Multiple agents augmenting the same parent node simultaneously:
+#   - Each augmentation is processed atomically (sequential within parent)
+#   - IDs must be unique; collision → rejection with "duplicate_node_id"
+#   - Budget is checked-and-decremented atomically
+#   - Slot count is checked-and-decremented atomically
+#
+# ── Name Collision ────────────────────────────────────────────────────────────
+# Augmented node ID must not match any existing node ID in the workflow.
+# If collision: reject with reason "node_id_exists: {id}"
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 7. GOVERNANCE & AUDIT                                                       │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ── Auto-Approve Rules ────────────────────────────────────────────────────────
+# An augmentation is auto-approved when ALL of:
+#   1. injection_rules.auto_approve == true
+#   2. Total cost of new nodes <= remaining cost_budget_usd
+#   3. Count of new nodes <= remaining max_children slots
+#   4. All new node types ∈ injection_rules.allowed_types
+#   5. Source agent ∈ injection_rules.allowed_sources (if specified)
+#
+# If any condition fails → status becomes "pending_approval"
+#
+# ── Human Gate ────────────────────────────────────────────────────────────────
+# When auto_approve is false, or when auto-approve conditions fail:
+#   - The augmentation enters "pending_approval" state
+#   - A notification is sent to requires_approval_from (user or node assignee)
+#   - The parent node enters "waiting_approval" state
+#   - UI shows the proposed nodes with a diff view
+#   - Approver can: approve, reject, or modify-then-approve
+#
+# ── Audit Trail ───────────────────────────────────────────────────────────────
+# Every augmentation (applied or rejected) is recorded:
+#
+# ```typescript
+# interface AugmentationAuditEntry {
+#   augmentation_id: string;
+#   workflow_instance_id: string;
+#   parent_node_id: string;
+#   timestamp: number;
+#   action: 'applied' | 'rejected' | 'approved' | 'auto_approved';
+#   actor: string;                 // Agent run ID or human username
+#   reason: string;                // Why the agent wanted to augment
+#   nodes_proposed: AugmentedNodeDef[];
+#   edges_proposed: AugmentedEdge[];
+#   rejection_reason?: string;
+#   cost_at_time: number;          // Budget consumed so far
+#   approval_comment?: string;
+# }
+# ```
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 8. REAL-TIME VISUALIZATION                                                  │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# ── WebSocket Events ──────────────────────────────────────────────────────────
+# The frontend subscribes to workflow instance events via WebSocket:
+#
+# ws://localhost:8080/api/v1/workflows/{instance_id}/events
+#
+# Event types streamed:
+#   - node_state_changed:    { node_id, old_state, new_state, timestamp }
+#   - workflow_augmented:    { augmentation_id, parent_node_id, nodes, edges }
+#   - node_output_updated:   { node_id, outputs }
+#   - workflow_state_changed: { old_state, new_state }
+#
+# ── UI Rendering of Augmented Nodes ──────────────────────────────────────────
+# Augmented nodes are visually distinguished:
+#   - Dashed border (vs solid for static nodes)
+#   - "⚡ Injected" badge
+#   - Grouped under parent node (collapsible cluster)
+#   - Subtle animation on injection (fade-in + edge draw)
+#   - Hover tooltip shows: injected_by, injected_at, augmentation_id
+#
+# ── Diff View ─────────────────────────────────────────────────────────────────
+# "Template vs Actual" comparison:
+#   - Left: original YAML template (static nodes only)
+#   - Right: runtime state (static + augmented nodes)
+#   - Highlighted: augmented nodes in accent color
+#   - Metrics: "Template: 5 nodes → Runtime: 17 nodes (+12 discovered)"
+#
+# ── Critical Path Highlighting ────────────────────────────────────────────────
+# Real-time critical path computation updates as nodes are injected:
+#   - Longest path through DAG highlighted in red
+#   - Bottleneck nodes (on critical path + longest duration) pulsed
+#   - Parallel branches shown with slack time annotations
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 9. COMPLETE AUGMENTATION FLOW EXAMPLE                                       │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# Scenario: "Run Tests" node in a deploy workflow.
+# Agent starts → reads project → finds 4 test suites → injects 4 child nodes.
+#
+# Step 1: Workflow starts, "run-tests" node becomes running
+# Step 2: Agent (bound to run-tests) reads the project structure
+# Step 3: Agent calls the augmentation API:
+#
+#   POST /api/v1/workflows/wf-inst-001/nodes/run-tests/augment
+#   {
+#     "nodes": [
+#       {"id": "test-auth",     "type": "agent_task", "label": "Auth Tests",     "config": {"prompt": "pytest tests/auth/"}},
+#       {"id": "test-payments", "type": "agent_task", "label": "Payment Tests",  "config": {"prompt": "pytest tests/payments/"}},
+#       {"id": "test-users",    "type": "agent_task", "label": "User Tests",     "config": {"prompt": "pytest tests/users/"}},
+#       {"id": "test-api",      "type": "agent_task", "label": "API Tests",      "config": {"prompt": "pytest tests/api/"}}
+#     ],
+#     "reason": "Discovered 4 test directories in project",
+#     "source_run_id": "claude-code:session-run-tests"
+#   }
+#
+# Step 4: Engine validates (types allowed, budget ok, no cycles) → auto-approves
+# Step 5: 4 child nodes created in "ready" state
+# Step 6: WebSocket broadcasts workflow_augmented event
+# Step 7: UI animates 4 new nodes appearing under "run-tests"
+# Step 8: Scheduler picks up ready nodes, spawns 4 parallel agent runs
+# Step 9: As each completes, parent node tracks progress
+# Step 10: When all 4 complete (join_mode: all), parent "run-tests" completes
+# Step 11: Downstream nodes (quality-gate) become ready
+#
+# The parent node's outputs automatically include merged child outputs:
+#   outputs.children_results: [
+#     {id: "test-auth", passed: true, count: 45},
+#     {id: "test-payments", passed: true, count: 23},
+#     {id: "test-users", passed: false, count: 38, failures: [...]},
+#     {id: "test-api", passed: true, count: 67}
+#   ]
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 10. MAPPING TopologyEdge TO WORKFLOW NODES                                  │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# When the Witness platform observes AgentRun topology (from adapters), it can
+# retroactively map runs to workflow nodes:
+#
+# ── Forward mapping (template → runs) ────────────────────────────────────────
+# A workflow node with bound_run.match_criteria finds matching AgentRuns:
+#   - Query: runs WHERE source=criteria.source AND cwd GLOB criteria.workspace_pattern
+#   - Bind: node.bound_run.run_id = matched_run.id
+#   - Status sync: node state mirrors run status
+#
+# ── Reverse mapping (runs → detected workflow) ────────────────────────────────
+# TopologyEdge records are translated to workflow structure:
+#   - Each AgentRun → one workflow node (type: agent_task)
+#   - Each TopologyEdge → one depends_on relationship
+#   - SpawnKind maps to edge metadata:
+#       'subagent'     → standard depends_on (parent spawned child)
+#       'fork'         → parallel branch (siblings share parent)
+#       'handoff'      → sequential chain (continuation)
+#       'continuation' → same as handoff but same logical task
+#
+# ── Hybrid reconciliation ─────────────────────────────────────────────────────
+# For hybrid workflows, the engine reconciles template with observed reality:
+#   1. Template node "run-tests" is running, bound to AgentRun X
+#   2. AgentRun X spawns children Y, Z (TopologyEdge)
+#   3. If "run-tests" is augmentable → auto-create augmented nodes for Y, Z
+#   4. If "run-tests" is NOT augmentable → record as "unplanned children" (warning)
+#   5. UI shows both planned structure and actual execution topology

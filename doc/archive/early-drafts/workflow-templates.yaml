@@ -1,0 +1,762 @@
+# ============================================================
+# Workflow Template: Deploy Pipeline
+# A multi-environment deployment with approval gates,
+# conditional paths, and rollback capability.
+# ============================================================
+apiVersion: witness/v1
+kind: WorkflowTemplate
+metadata:
+  name: deploy-pipeline
+  version: "1.0.0"
+  description: "CI/CD deployment pipeline with approval gates and rollback"
+  author: witness-team
+  tags: [deploy, ci-cd, production]
+
+# ─── Parameters ──────────────────────────────────────────────
+# Callers provide these; templates reference via ${{ params.X }}
+parameters:
+  - name: environment
+    type: enum
+    values: [dev, staging, prod]
+    default: staging
+    description: "Target deployment environment"
+
+  - name: version
+    type: string
+    required: true
+    pattern: "^v\\d+\\.\\d+\\.\\d+(-[a-z0-9.]+)?$"
+    description: "Semantic version to deploy (e.g. v2.1.0)"
+
+  - name: skip_tests
+    type: boolean
+    default: false
+    description: "Skip test suite (emergency deploys only)"
+
+  - name: rollback_on_failure
+    type: boolean
+    default: true
+    description: "Automatically rollback if smoke tests fail"
+
+  - name: notify_channel
+    type: string
+    default: "#deploys"
+    description: "Slack channel for notifications"
+
+# ─── Triggers ────────────────────────────────────────────────
+triggers:
+  # Manual trigger with approval requirement for prod
+  - type: manual
+    name: manual-deploy
+    description: "Manually trigger deployment"
+    approval:
+      required_when: "${{ params.environment == 'prod' }}"
+      approvers: [platform-leads, sre-oncall]
+      min_approvals: 2
+      timeout_minutes: 60
+
+  # Auto-trigger on Git tag push
+  - type: webhook
+    name: tag-push
+    source: github
+    events: [push]
+    filters:
+      ref_pattern: "refs/tags/v*"
+    parameter_mapping:
+      version: "${{ event.ref | replace('refs/tags/', '') }}"
+      environment: staging  # tags always go to staging first
+
+  # Scheduled staging deploy (nightly from main)
+  - type: schedule
+    name: nightly-staging
+    cron: "0 2 * * 1-5"  # 2 AM weekdays
+    parameters:
+      environment: staging
+      version: "${{ git.latest_tag }}"
+
+# ─── Nodes ───────────────────────────────────────────────────
+nodes:
+  - id: checkout
+    label: "Checkout ${{ params.version }}"
+    type: task
+    agent: git-agent
+    config:
+      command: "git checkout ${{ params.version }}"
+      workspace: "${{ env.REPO_ROOT }}"
+    timeout_ms: 30000
+
+  - id: build
+    label: "Build"
+    type: task
+    agent: build-agent
+    config:
+      command: "npm run build -- --env=${{ params.environment }}"
+      cache_key: "build-${{ params.version }}"
+    timeout_ms: 300000  # 5 min
+
+  - id: test
+    label: "Test Suite"
+    type: task
+    agent: test-agent
+    # Conditional: skip when params.skip_tests is true
+    condition: "${{ !params.skip_tests }}"
+    config:
+      command: "npm run test:ci"
+      coverage_report: true
+    timeout_ms: 600000  # 10 min
+
+  - id: security-scan
+    label: "Security Scan"
+    type: task
+    agent: security-agent
+    # Runs in parallel with test (same dependencies)
+    config:
+      scanners: [snyk, trivy, semgrep]
+      fail_on: [critical, high]
+    timeout_ms: 300000
+
+  - id: approval-gate
+    label: "Deploy Approval"
+    type: approval
+    # Only require approval for production
+    condition: "${{ params.environment == 'prod' }}"
+    config:
+      approvers: [platform-leads]
+      message: "Approve deploy of ${{ params.version }} to ${{ params.environment }}?"
+      timeout_minutes: 120
+
+  - id: deploy
+    label: "Deploy to ${{ params.environment }}"
+    type: task
+    agent: deploy-agent
+    config:
+      environment: "${{ params.environment }}"
+      version: "${{ params.version }}"
+      strategy: rolling
+      health_check_url: "${{ env[params.environment + '_URL'] }}/health"
+    timeout_ms: 600000
+
+  - id: smoke-test
+    label: "Smoke Test"
+    type: task
+    agent: test-agent
+    config:
+      command: "npm run test:smoke -- --target=${{ env[params.environment + '_URL'] }}"
+      retries: 2
+    timeout_ms: 120000
+
+  - id: rollback
+    label: "Rollback"
+    type: task
+    agent: deploy-agent
+    # Only executes if smoke-test fails AND rollback enabled
+    condition: "${{ params.rollback_on_failure }}"
+    trigger_on: failure  # activated by smoke-test failure
+    config:
+      action: rollback
+      environment: "${{ params.environment }}"
+    timeout_ms: 300000
+
+  - id: notify
+    label: "Notify ${{ params.notify_channel }}"
+    type: notification
+    config:
+      channel: "${{ params.notify_channel }}"
+      template: |
+        *Deploy ${{ workflow.status }}*: `${{ params.version }}` → ${{ params.environment }}
+        Duration: ${{ workflow.duration_human }}
+        Triggered by: ${{ workflow.trigger.actor }}
+
+# ─── Edges (Dependencies) ───────────────────────────────────
+edges:
+  - source: checkout
+    target: build
+    type: dependency
+
+  - source: build
+    target: test
+    type: dependency
+    condition: "${{ !params.skip_tests }}"
+
+  - source: build
+    target: security-scan
+    type: dependency
+    # test and security-scan run in parallel after build
+
+  - source: test
+    target: approval-gate
+    type: dependency
+
+  - source: security-scan
+    target: approval-gate
+    type: dependency
+
+  - source: approval-gate
+    target: deploy
+    type: dependency
+
+  # When tests are skipped, build goes directly to approval
+  - source: build
+    target: approval-gate
+    type: dependency
+    condition: "${{ params.skip_tests }}"
+
+  - source: deploy
+    target: smoke-test
+    type: dependency
+
+  - source: smoke-test
+    target: notify
+    type: dependency
+    label: "on success"
+
+  - source: smoke-test
+    target: rollback
+    type: dependency
+    label: "on failure"
+    trigger_condition: failure
+
+  - source: rollback
+    target: notify
+    type: dependency
+
+# ─── Hooks ───────────────────────────────────────────────────
+on_success:
+  - action: tag_release
+    config:
+      tag: "${{ params.version }}-deployed-${{ params.environment }}"
+
+on_failure:
+  - action: notify
+    config:
+      channel: "#incidents"
+      severity: high
+      message: "Deploy failed: ${{ params.version }} to ${{ params.environment }}"
+  - action: create_incident
+    condition: "${{ params.environment == 'prod' }}"
+
+
+---
+# ============================================================
+# Workflow Template: Code Review
+# Automated quality checks + AI review + human approval flow
+# ============================================================
+apiVersion: witness/v1
+kind: WorkflowTemplate
+metadata:
+  name: code-review-workflow
+  version: "1.0.0"
+  description: "Automated code review pipeline with AI analysis and human approval"
+  author: witness-team
+  tags: [review, quality, pr]
+
+parameters:
+  - name: pr_number
+    type: integer
+    required: true
+    description: "Pull request number"
+
+  - name: reviewers
+    type: list
+    items_type: string
+    default: []
+    description: "Explicit reviewer list (auto-assigned if empty)"
+
+  - name: auto_merge
+    type: boolean
+    default: false
+    description: "Auto-merge when all checks pass and approved"
+
+  - name: coverage_threshold
+    type: number
+    default: 80.0
+    min: 0
+    max: 100
+    description: "Minimum test coverage percentage"
+
+  - name: review_depth
+    type: enum
+    values: [quick, standard, thorough]
+    default: standard
+    description: "AI review thoroughness level"
+
+triggers:
+  - type: event
+    name: pr-opened
+    source: github
+    events: [pull_request.opened, pull_request.synchronize]
+    filters:
+      base_branch: [main, develop]
+      # Don't trigger on draft PRs
+      draft: false
+    parameter_mapping:
+      pr_number: "${{ event.pull_request.number }}"
+
+  - type: manual
+    name: re-review
+    description: "Re-run review on existing PR"
+    parameters_required: [pr_number]
+
+  - type: event
+    name: review-requested
+    source: github
+    events: [pull_request.review_requested]
+    parameter_mapping:
+      pr_number: "${{ event.pull_request.number }}"
+      reviewers: "${{ event.requested_reviewers | map('login') }}"
+
+nodes:
+  - id: fetch-diff
+    label: "Fetch PR #${{ params.pr_number }}"
+    type: task
+    agent: git-agent
+    config:
+      action: fetch_pr_diff
+      pr_number: "${{ params.pr_number }}"
+      include_file_tree: true
+    timeout_ms: 30000
+
+  - id: lint
+    label: "Lint"
+    type: task
+    agent: quality-agent
+    config:
+      command: "npm run lint -- --changed-since=origin/main"
+      fix: false
+    timeout_ms: 120000
+
+  - id: type-check
+    label: "Type Check"
+    type: task
+    agent: quality-agent
+    config:
+      command: "npx tsc --noEmit"
+    timeout_ms: 120000
+
+  - id: unit-test
+    label: "Unit Tests"
+    type: task
+    agent: test-agent
+    config:
+      command: "npm run test:ci -- --coverage"
+      coverage_output: "coverage/lcov.info"
+    timeout_ms: 300000
+
+  - id: coverage-check
+    label: "Coverage ≥ ${{ params.coverage_threshold }}%"
+    type: condition
+    config:
+      expression: "${{ steps.unit-test.outputs.coverage_percent >= params.coverage_threshold }}"
+      fail_message: "Coverage ${{ steps.unit-test.outputs.coverage_percent }}% < ${{ params.coverage_threshold }}% threshold"
+    timeout_ms: 5000
+
+  - id: ai-review
+    label: "AI Review (${{ params.review_depth }})"
+    type: task
+    agent: review-agent
+    config:
+      pr_number: "${{ params.pr_number }}"
+      depth: "${{ params.review_depth }}"
+      focus_areas: [bugs, security, performance, readability]
+      post_comments: true
+      generate_summary: true
+    timeout_ms: 600000  # AI review can be slow for large PRs
+
+  - id: human-review
+    label: "Human Review"
+    type: approval
+    config:
+      reviewers: "${{ params.reviewers || auto_assign(params.pr_number) }}"
+      min_approvals: 1
+      dismiss_stale: true  # dismiss if new commits pushed
+      message: |
+        PR #${{ params.pr_number }} ready for review.
+        AI Summary: ${{ steps.ai-review.outputs.summary }}
+      timeout_minutes: 1440  # 24h
+
+  - id: merge
+    label: "Merge PR"
+    type: task
+    agent: git-agent
+    condition: "${{ params.auto_merge }}"
+    config:
+      action: merge
+      pr_number: "${{ params.pr_number }}"
+      method: squash
+      delete_branch: true
+    timeout_ms: 30000
+
+  - id: notify-complete
+    label: "Post Status"
+    type: notification
+    config:
+      target: github_status
+      pr_number: "${{ params.pr_number }}"
+      summary: |
+        ✓ Lint: ${{ steps.lint.status }}
+        ✓ Types: ${{ steps.type-check.status }}
+        ✓ Tests: ${{ steps.unit-test.status }} (${{ steps.unit-test.outputs.coverage_percent }}%)
+        ✓ AI Review: ${{ steps.ai-review.outputs.issue_count }} issues found
+        ✓ Human: ${{ steps.human-review.status }}
+
+edges:
+  - source: fetch-diff
+    target: lint
+    type: dependency
+
+  - source: fetch-diff
+    target: type-check
+    type: dependency
+
+  - source: fetch-diff
+    target: unit-test
+    type: dependency
+    # lint, type-check, unit-test all run in parallel
+
+  - source: unit-test
+    target: coverage-check
+    type: data-flow
+
+  - source: lint
+    target: ai-review
+    type: dependency
+
+  - source: type-check
+    target: ai-review
+    type: dependency
+
+  - source: coverage-check
+    target: ai-review
+    type: dependency
+    # AI review starts after all automated checks pass
+
+  - source: ai-review
+    target: human-review
+    type: dependency
+
+  - source: human-review
+    target: merge
+    type: dependency
+    label: "approved"
+
+  - source: human-review
+    target: notify-complete
+    type: dependency
+
+  - source: merge
+    target: notify-complete
+    type: dependency
+
+on_success:
+  - action: label_pr
+    config:
+      pr_number: "${{ params.pr_number }}"
+      add: [reviewed, ready-to-merge]
+      remove: [needs-review]
+
+on_failure:
+  - action: label_pr
+    config:
+      pr_number: "${{ params.pr_number }}"
+      add: [needs-fixes]
+  - action: comment_pr
+    config:
+      pr_number: "${{ params.pr_number }}"
+      body: "❌ Review pipeline failed at: ${{ workflow.failed_node }}"
+
+
+---
+# ============================================================
+# Workflow Template: Debug-Fix Cycle
+# Iterative bug fix loop with automatic reproduction,
+# diagnosis, fix attempt, and validation.
+# ============================================================
+apiVersion: witness/v1
+kind: WorkflowTemplate
+metadata:
+  name: debug-fix-cycle
+  version: "1.0.0"
+  description: "Iterative debug → fix → test loop with escalation"
+  author: witness-team
+  tags: [debug, fix, automation, iterative]
+
+parameters:
+  - name: issue_id
+    type: string
+    required: true
+    description: "Issue/bug tracker ID (e.g. GH-1234)"
+
+  - name: max_iterations
+    type: integer
+    default: 3
+    min: 1
+    max: 10
+    description: "Maximum fix attempts before escalation"
+
+  - name: target_branch
+    type: string
+    default: main
+    description: "Branch to base the fix on"
+
+  - name: test_command
+    type: string
+    default: "npm test"
+    description: "Command to validate the fix"
+
+  - name: auto_pr
+    type: boolean
+    default: true
+    description: "Automatically create PR on successful fix"
+
+  - name: escalation_assignee
+    type: string
+    default: ""
+    description: "Who to assign if max iterations exhausted"
+
+triggers:
+  - type: event
+    name: issue-labeled
+    source: github
+    events: [issues.labeled]
+    filters:
+      label: auto-fix
+      state: open
+    parameter_mapping:
+      issue_id: "${{ event.issue.number }}"
+
+  - type: manual
+    name: manual-debug
+    description: "Manually trigger debug cycle for an issue"
+    parameters_required: [issue_id]
+
+  - type: webhook
+    name: flaky-test-detected
+    source: ci
+    events: [test_flake]
+    parameter_mapping:
+      issue_id: "${{ event.test_id }}"
+      test_command: "${{ event.test_command }}"
+
+nodes:
+  - id: setup
+    label: "Setup Workspace"
+    type: task
+    agent: git-agent
+    config:
+      action: create_branch
+      base: "${{ params.target_branch }}"
+      branch_name: "fix/${{ params.issue_id }}"
+      workspace: isolated  # use git worktree
+    timeout_ms: 30000
+
+  - id: reproduce
+    label: "Reproduce Bug"
+    type: task
+    agent: debug-agent
+    config:
+      issue_id: "${{ params.issue_id }}"
+      action: reproduce
+      test_command: "${{ params.test_command }}"
+      collect_artifacts: [logs, stacktrace, reproduction_steps]
+    timeout_ms: 300000
+    retry:
+      max_attempts: 2
+      backoff_ms: 5000
+
+  - id: diagnose
+    label: "Diagnose Root Cause"
+    type: task
+    agent: debug-agent
+    config:
+      action: diagnose
+      reproduction_output: "${{ steps.reproduce.outputs }}"
+      analysis_depth: thorough
+      tools: [ast_search, git_blame, test_bisect]
+    timeout_ms: 600000
+
+  - id: implement-fix
+    label: "Implement Fix (iter ${{ loop.iteration }}/${{ params.max_iterations }})"
+    type: task
+    agent: coding-agent
+    config:
+      action: fix
+      diagnosis: "${{ steps.diagnose.outputs }}"
+      issue_id: "${{ params.issue_id }}"
+      # On subsequent iterations, include feedback from previous test failure
+      previous_attempt: "${{ loop.iteration > 1 ? steps.validate-fix.outputs.failure_reason : null }}"
+      constraints:
+        - "Minimal diff — change only what's needed"
+        - "Add regression test covering the fix"
+        - "Don't break existing tests"
+    timeout_ms: 900000  # 15 min for complex fixes
+
+  - id: test
+    label: "Run Tests"
+    type: task
+    agent: test-agent
+    config:
+      command: "${{ params.test_command }}"
+      include_new_tests: true
+    timeout_ms: 600000
+
+  - id: validate-fix
+    label: "Validate Fix"
+    type: condition
+    config:
+      expression: "${{ steps.test.outputs.exit_code == 0 }}"
+      # On failure, this node outputs failure_reason for next iteration
+      outputs_on_failure:
+        failure_reason: "${{ steps.test.outputs.stderr }}"
+        failed_tests: "${{ steps.test.outputs.failed_tests }}"
+    timeout_ms: 5000
+
+  # Loop control: go back to implement-fix if validation failed
+  - id: loop-decision
+    label: "Retry? (${{ loop.iteration }}/${{ params.max_iterations }})"
+    type: condition
+    condition: "${{ steps.validate-fix.status == 'failed' }}"
+    config:
+      expression: "${{ loop.iteration < params.max_iterations }}"
+      # true = loop back; false = escalate
+    timeout_ms: 1000
+
+  - id: escalate
+    label: "Escalate to Human"
+    type: notification
+    # Only reached when max iterations exhausted
+    condition: "${{ loop.iteration >= params.max_iterations && steps.validate-fix.status == 'failed' }}"
+    config:
+      target: github_issue
+      issue_id: "${{ params.issue_id }}"
+      action: comment_and_assign
+      assignee: "${{ params.escalation_assignee || 'oncall' }}"
+      message: |
+        🔄 Auto-fix exhausted ${{ params.max_iterations }} iterations.
+        
+        **Last diagnosis:** ${{ steps.diagnose.outputs.root_cause }}
+        **Last failure:** ${{ steps.validate-fix.outputs.failure_reason }}
+        **Branch:** fix/${{ params.issue_id }}
+        **Files touched:** ${{ steps.implement-fix.outputs.files_changed }}
+        
+        Needs human intervention.
+      labels_add: [needs-human, auto-fix-failed]
+
+  - id: create-pr
+    label: "Create PR"
+    type: task
+    agent: git-agent
+    condition: "${{ params.auto_pr && steps.validate-fix.status == 'completed' }}"
+    config:
+      action: create_pr
+      branch: "fix/${{ params.issue_id }}"
+      base: "${{ params.target_branch }}"
+      title: "fix: ${{ steps.diagnose.outputs.root_cause_summary }}"
+      body: |
+        Closes #${{ params.issue_id }}
+        
+        ## Root Cause
+        ${{ steps.diagnose.outputs.root_cause }}
+        
+        ## Fix
+        ${{ steps.implement-fix.outputs.fix_summary }}
+        
+        ## Validation
+        - Tests pass: ✓ (${{ loop.iteration }} iteration(s))
+        - Regression test added: ✓
+      labels: [auto-fix, bug]
+      reviewers: "${{ steps.diagnose.outputs.code_owners }}"
+    timeout_ms: 30000
+
+  - id: notify-success
+    label: "Notify Success"
+    type: notification
+    condition: "${{ steps.validate-fix.status == 'completed' }}"
+    config:
+      target: github_issue
+      issue_id: "${{ params.issue_id }}"
+      action: comment
+      message: |
+        ✅ Auto-fix successful in ${{ loop.iteration }} iteration(s).
+        PR: ${{ steps.create-pr.outputs.pr_url }}
+
+edges:
+  - source: setup
+    target: reproduce
+    type: dependency
+
+  - source: reproduce
+    target: diagnose
+    type: data-flow
+
+  - source: diagnose
+    target: implement-fix
+    type: data-flow
+
+  - source: implement-fix
+    target: test
+    type: dependency
+
+  - source: test
+    target: validate-fix
+    type: data-flow
+
+  - source: validate-fix
+    target: loop-decision
+    type: dependency
+    label: "failed"
+    trigger_condition: failure
+
+  - source: validate-fix
+    target: create-pr
+    type: dependency
+    label: "passed"
+    trigger_condition: success
+
+  - source: validate-fix
+    target: notify-success
+    type: dependency
+    trigger_condition: success
+
+  # Loop-back edge: retry from implement-fix with new context
+  - source: loop-decision
+    target: implement-fix
+    type: loop-back
+    label: "retry (iteration < max)"
+    trigger_condition: success  # condition evaluated true = can retry
+
+  # Escalation edge: loop-decision says "no more retries"
+  - source: loop-decision
+    target: escalate
+    type: dependency
+    label: "max reached"
+    trigger_condition: failure  # condition false = exhausted
+
+# ─── Loop Configuration ──────────────────────────────────────
+loop:
+  # The loop-back edge from loop-decision → implement-fix
+  # creates an iteration cycle bounded by max_iterations
+  max_iterations: "${{ params.max_iterations }}"
+  iteration_variable: loop.iteration  # accessible in node configs
+  carry_forward:
+    # State carried between iterations
+    - steps.diagnose.outputs        # root cause stays
+    - steps.validate-fix.outputs    # failure feedback for next attempt
+
+on_success:
+  - action: label_issue
+    config:
+      issue_id: "${{ params.issue_id }}"
+      add: [auto-fixed]
+      remove: [auto-fix, bug]
+  - action: close_issue
+    config:
+      issue_id: "${{ params.issue_id }}"
+      reason: "Fixed by auto-debug cycle"
+
+on_failure:
+  - action: metric
+    config:
+      name: "auto_fix_failure"
+      tags:
+        issue: "${{ params.issue_id }}"
+        iterations: "${{ loop.iteration }}"
+        reason: "${{ workflow.failed_node }}"

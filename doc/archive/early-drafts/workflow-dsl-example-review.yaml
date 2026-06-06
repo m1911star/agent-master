@@ -1,0 +1,523 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Example: Code Review Pipeline Workflow
+# ═══════════════════════════════════════════════════════════════════════════════
+# Demonstrates:
+#   - Multiple parallel review agents (each becomes an AgentRun)
+#   - Human reviewer integration
+#   - Iterative subworkflow (request changes → fix → re-review loop)
+#   - Runtime augmentation (discover additional review targets)
+#   - Structured data flow (findings accumulation)
+#   - Conditional severity routing
+#   - Integration with AgentRun/TopologyEdge model
+
+workflow:
+  id: review/code-review-pipeline
+  name: Code Review Pipeline
+  version: "2.0.0"
+  description: |
+    Automated multi-agent code review with human oversight.
+    Runs parallel specialist reviewers, aggregates findings,
+    and gates merge on quality thresholds.
+  author: engineering-platform
+  tags: [review, pr, quality, agents]
+  origin: hybrid   # Template with augmentation points for discovered files
+
+  # ── Triggers ──────────────────────────────────────────────────────────────
+  triggers:
+    - type: git_pr
+      config:
+        actions: ["opened", "synchronize"]
+        base_branches: ["main", "develop"]
+      condition: ${{ trigger.payload.draft == false }}
+
+    - type: manual
+      config:
+        inputs:
+          pr_number:
+            type: number
+            required: true
+          force_full_review:
+            type: boolean
+            default: false
+
+  # ── Variables ─────────────────────────────────────────────────────────────
+  variables:
+    pr_number:
+      type: number
+      required: true
+      description: "Pull request number"
+    pr_author:
+      type: string
+      required: true
+      description: "PR author username"
+    base_branch:
+      type: string
+      default: "main"
+    repo_path:
+      type: string
+      required: true
+    changed_files:
+      type: array
+      default: []
+      description: "Accumulated list of files needing review"
+    max_review_iterations:
+      type: number
+      default: 3
+      description: "Maximum request-changes cycles before escalation"
+    severity_threshold:
+      type: string
+      default: "warning"
+      enum: [info, warning, error, critical]
+      description: "Minimum severity to block merge"
+
+  # ── Defaults ──────────────────────────────────────────────────────────────
+  defaults:
+    timeout: "20m"
+    retry:
+      max_attempts: 1
+      backoff: fixed
+      delay: "10s"
+    agent:
+      source: claude-code
+      model: claude-sonnet-4-20250514
+      permission_mode: default   # Read-only for reviews
+      max_turns: 40
+      cost_limit_usd: 2.00
+
+  on_failure:
+    strategy: continue  # Don't block PR on infra failures
+    notification:
+      channels: ["slack:#code-review-bot"]
+      message: "Review pipeline error for PR #{{variables.pr_number}}: {{failed_node.label}}"
+
+  # ── Nodes ─────────────────────────────────────────────────────────────────
+  nodes:
+
+    # ═══ STAGE 1: Diff Analysis ═══════════════════════════════════════════════
+    - id: analyze-diff
+      type: agent_task
+      label: "Analyze PR Diff"
+      description: "Parse changed files, compute complexity metrics, classify changes"
+      config:
+        prompt: |
+          Analyze PR #{{variables.pr_number}} on branch {{base_branch}}:
+          1. List all changed files with change type (added/modified/deleted)
+          2. Compute complexity: lines changed, files touched, packages affected
+          3. Classify changes: feature, bugfix, refactor, config, docs, test
+          4. Identify high-risk files (core logic, auth, payments, data migration)
+          5. Suggest which specialist reviewers are needed based on changes
+          Output structured JSON with files list and metadata.
+        workspace:
+          cwd: ${{ variables.repo_path }}
+          git_branch: ${{ trigger.payload.head_branch }}
+        tools_allowed: [bash, read, search]
+        max_turns: 15
+        cost_limit_usd: 1.00
+      outputs:
+        changed_files:
+          type: array
+          description: "[{path, change_type, lines_added, lines_removed, risk_level}]"
+        complexity_score:
+          type: number
+          description: "0-100 complexity rating"
+        change_categories:
+          type: array
+          description: "['feature', 'bugfix', ...]"
+        recommended_reviewers:
+          type: array
+          description: "Specialist types needed: ['security', 'performance', ...]"
+        high_risk_files:
+          type: array
+      timeout: "5m"
+      # Agent can discover additional files to review (e.g., affected downstream)
+      augmentable: true
+      injection_rules:
+        max_children: 5
+        allowed_types: [agent_task]
+        auto_approve: true
+        cost_budget_usd: 3.00
+
+    # ═══ STAGE 2: Parallel Review Agents ══════════════════════════════════════
+    # Each reviewer maps to an independent AgentRun (spawnKind: 'subagent')
+    # Topology: this workflow instance is the root; each reviewer is a child run
+
+    - id: review-security
+      type: agent_task
+      label: "🔒 Security Review"
+      depends_on: [analyze-diff]
+      conditions:
+        when: ${{ 'security' in nodes.analyze-diff.outputs.recommended_reviewers || len(nodes.analyze-diff.outputs.high_risk_files) > 0 }}
+      config:
+        agent_source: claude-code
+        model: claude-sonnet-4-20250514
+        prompt: |
+          Security review of PR #{{variables.pr_number}}.
+          Focus on these changed files:
+          {{nodes.analyze-diff.outputs.changed_files}}
+
+          Check for:
+          - SQL injection, XSS, CSRF vulnerabilities
+          - Authentication/authorization bypass
+          - Secret/credential exposure
+          - Insecure deserialization
+          - Path traversal
+          - Dependency vulnerabilities in new packages
+          - Improper error handling (info leakage)
+
+          For each finding, output:
+          {severity: critical|high|medium|low, file, line, title, description, suggestion}
+        tools_allowed: [read, search, bash]
+        max_turns: 30
+        cost_limit_usd: 3.00
+      inputs:
+        files:
+          from: ${{ nodes.analyze-diff.outputs.changed_files }}
+      outputs:
+        findings:
+          type: array
+          description: "[{severity, file, line, title, description, suggestion}]"
+        summary:
+          type: string
+        max_severity:
+          type: string
+      # This node binds to an AgentRun for topology tracking
+      bound_run:
+        match_criteria:
+          source: claude-code
+          spawn_kind: subagent
+      timeout: "15m"
+
+    - id: review-performance
+      type: agent_task
+      label: "⚡ Performance Review"
+      depends_on: [analyze-diff]
+      conditions:
+        when: ${{ 'performance' in nodes.analyze-diff.outputs.recommended_reviewers }}
+      config:
+        agent_source: claude-code
+        prompt: |
+          Performance review of PR #{{variables.pr_number}}.
+          Analyze changed files for:
+          - N+1 queries or unindexed DB access
+          - Unbounded loops or collections
+          - Missing pagination
+          - Memory leaks (event listeners, closures, streams)
+          - Blocking I/O on hot paths
+          - Bundle size regression (new large dependencies)
+          - Missing caching opportunities
+          - Algorithmic complexity issues (O(n²) where O(n) possible)
+
+          For each finding, output:
+          {severity, file, line, title, description, suggestion, estimated_impact}
+        tools_allowed: [read, search, bash]
+        max_turns: 25
+        cost_limit_usd: 2.50
+      inputs:
+        files:
+          from: ${{ nodes.analyze-diff.outputs.changed_files }}
+      outputs:
+        findings:
+          type: array
+        summary:
+          type: string
+        max_severity:
+          type: string
+      bound_run:
+        match_criteria:
+          source: claude-code
+          spawn_kind: subagent
+      timeout: "15m"
+
+    - id: review-style
+      type: agent_task
+      label: "🎨 Style & Lint Review"
+      depends_on: [analyze-diff]
+      config:
+        prompt: |
+          Style and lint review of PR #{{variables.pr_number}}.
+          Check for:
+          - Code style violations not caught by linter
+          - Naming conventions (variables, functions, types)
+          - Dead code or commented-out code
+          - Missing documentation on public APIs
+          - Inconsistent patterns vs. existing codebase
+          - Import organization
+          - Type safety issues (TypeScript any, missing null checks)
+          - Test coverage gaps for new code
+
+          For each finding, output:
+          {severity, file, line, title, description, suggestion, auto_fixable}
+        tools_allowed: [read, search, bash]
+        max_turns: 20
+        cost_limit_usd: 1.50
+      inputs:
+        files:
+          from: ${{ nodes.analyze-diff.outputs.changed_files }}
+      outputs:
+        findings:
+          type: array
+        auto_fixable_count:
+          type: number
+        summary:
+          type: string
+        max_severity:
+          type: string
+      timeout: "10m"
+
+    - id: review-correctness
+      type: agent_task
+      label: "🧠 Logic & Correctness Review"
+      depends_on: [analyze-diff]
+      config:
+        model: claude-opus-4-20250514   # Use best model for logic review
+        prompt: |
+          Logic and correctness review of PR #{{variables.pr_number}}.
+          Analyze:
+          - Business logic errors
+          - Edge cases not handled (null, empty, overflow, concurrent access)
+          - Race conditions in async code
+          - State machine violations
+          - Contract/invariant violations
+          - Error handling completeness
+          - Backwards compatibility breaks
+          - Data consistency issues
+
+          For each finding, output:
+          {severity, file, line, title, description, suggestion, confidence: high|medium|low}
+        tools_allowed: [read, search, bash]
+        max_turns: 35
+        cost_limit_usd: 5.00
+      inputs:
+        files:
+          from: ${{ nodes.analyze-diff.outputs.changed_files }}
+      outputs:
+        findings:
+          type: array
+        summary:
+          type: string
+        max_severity:
+          type: string
+      timeout: "20m"
+      # Correctness reviewer can discover related files needing review
+      augmentable: true
+      injection_rules:
+        max_children: 3
+        allowed_types: [agent_task]
+        auto_approve: true
+        cost_budget_usd: 5.00
+
+    # ═══ STAGE 3: Findings Aggregation ════════════════════════════════════════
+    - id: aggregate-findings
+      type: gate
+      label: "Aggregate Review Findings"
+      description: "Collect and deduplicate findings from all reviewers"
+      depends_on:
+        - node: review-security
+          status: any_terminal
+        - node: review-performance
+          status: any_terminal
+        - node: review-style
+          status: any_terminal
+        - node: review-correctness
+          status: any_terminal
+      config:
+        mode: expression
+        expression: ${{ true }}   # Always passes — aggregation only
+        outputs_on_pass:
+          all_findings: ${{
+            concat(
+              coalesce(nodes.review-security.outputs.findings, []),
+              coalesce(nodes.review-performance.outputs.findings, []),
+              coalesce(nodes.review-style.outputs.findings, []),
+              coalesce(nodes.review-correctness.outputs.findings, [])
+            )
+          }}
+          critical_count: ${{
+            len(filter(all_findings, f => f.severity == 'critical'))
+          }}
+          high_count: ${{
+            len(filter(all_findings, f => f.severity == 'high'))
+          }}
+          has_blockers: ${{
+            critical_count > 0 || (high_count > 2 && variables.severity_threshold != 'critical')
+          }}
+      outputs:
+        all_findings:
+          type: array
+        critical_count:
+          type: number
+        high_count:
+          type: number
+        has_blockers:
+          type: boolean
+
+    # ═══ STAGE 4: Auto-Fix Suggestions ════════════════════════════════════════
+    - id: auto-fix
+      type: agent_task
+      label: "Generate Auto-Fix Suggestions"
+      depends_on: [aggregate-findings]
+      conditions:
+        when: ${{ len(nodes.aggregate-findings.outputs.all_findings) > 0 }}
+      config:
+        prompt: |
+          Based on these code review findings, generate fix suggestions:
+          {{nodes.aggregate-findings.outputs.all_findings}}
+
+          For each fixable finding:
+          1. Generate the exact code patch (unified diff format)
+          2. Explain the fix
+          3. Rate confidence: high (safe to auto-apply) | medium (likely correct) | low (needs human judgment)
+
+          Only suggest fixes for findings marked auto_fixable or with severity >= high.
+          Do NOT apply fixes — only suggest them.
+        tools_allowed: [read, search]
+        max_turns: 25
+        cost_limit_usd: 3.00
+      inputs:
+        findings:
+          from: ${{ nodes.aggregate-findings.outputs.all_findings }}
+      outputs:
+        fixes:
+          type: array
+          description: "[{finding_ref, patch, explanation, confidence}]"
+        auto_applicable_count:
+          type: number
+      timeout: "15m"
+
+    # ═══ STAGE 5: Severity Routing ════════════════════════════════════════════
+    - id: severity-gate
+      type: gate
+      label: "Severity Assessment"
+      depends_on: [aggregate-findings]
+      config:
+        mode: expression
+        expression: ${{ !nodes.aggregate-findings.outputs.has_blockers }}
+        outputs_on_pass:
+          review_status: "approved_by_agents"
+          merge_blocked: false
+        outputs_on_fail:
+          review_status: "changes_requested"
+          merge_blocked: true
+
+    # ═══ STAGE 6: Human Reviewer ══════════════════════════════════════════════
+    - id: human-review
+      type: human_checkpoint
+      label: "Human Code Review"
+      depends_on:
+        - aggregate-findings
+        - auto-fix
+      config:
+        assignee: ${{ variables.pr_author == 'bot' ? 'senior-eng' : 'team-reviewers' }}
+        message: |
+          ## Code Review Summary for PR #{{variables.pr_number}}
+
+          **Complexity:** {{nodes.analyze-diff.outputs.complexity_score}}/100
+          **Categories:** {{nodes.analyze-diff.outputs.change_categories}}
+
+          ### Findings
+          - 🔴 Critical: {{nodes.aggregate-findings.outputs.critical_count}}
+          - 🟠 High: {{nodes.aggregate-findings.outputs.high_count}}
+          - Total: {{len(nodes.aggregate-findings.outputs.all_findings)}}
+          - Auto-fixable: {{nodes.auto-fix.outputs.auto_applicable_count}}
+
+          ### Agent Recommendation
+          {{nodes.severity-gate.outputs.review_status}}
+
+          Review the detailed findings and auto-fix suggestions below.
+        context_nodes: [aggregate-findings, auto-fix, severity-gate]
+        actions:
+          - id: approve
+            label: "✅ Approve"
+            style: primary
+            transitions_to: completed
+            output_value: { decision: "approve" }
+          - id: request-changes
+            label: "🔄 Request Changes"
+            style: default
+            requires_comment: true
+            transitions_to: completed
+            output_value: { decision: "request_changes" }
+          - id: reject
+            label: "❌ Reject"
+            style: danger
+            requires_comment: true
+            transitions_to: completed
+            output_value: { decision: "reject" }
+        timeout_action: escalate
+        escalation:
+          after: "8h"
+          to: tech-lead
+        notification:
+          channels: ["slack:#code-reviews"]
+          remind_after: "2h"
+      timeout: "48h"
+
+    # ═══ STAGE 7: Request Changes Loop (Subworkflow) ══════════════════════════
+    - id: changes-loop
+      type: subworkflow
+      label: "Request Changes → Fix → Re-Review"
+      depends_on:
+        - node: human-review
+          status: completed
+      conditions:
+        when: ${{ nodes.human-review.outputs.action_result.decision == 'request_changes' }}
+      config:
+        workflow_ref: "workflows/review-iteration.yaml"
+        version: "^1.0.0"
+        input_mapping:
+          pr_number: ${{ variables.pr_number }}
+          findings: ${{ nodes.aggregate-findings.outputs.all_findings }}
+          fixes: ${{ nodes.auto-fix.outputs.fixes }}
+          human_comment: ${{ nodes.human-review.outputs.comment }}
+          iteration: 1
+          max_iterations: ${{ variables.max_review_iterations }}
+        output_mapping:
+          final_decision: "child.outputs.decision"
+          iteration_count: "child.outputs.iterations_used"
+        on_failure: fail_parent
+      outputs:
+        final_decision:
+          type: string
+        iteration_count:
+          type: number
+      timeout: "72h"  # Allow time for author to fix
+
+    # ═══ STAGE 8: Final Merge Gate ════════════════════════════════════════════
+    - id: merge-gate
+      type: gate
+      label: "Merge Gate"
+      depends_on:
+        - node: human-review
+          status: completed
+        - node: changes-loop
+          status: any_terminal   # May be skipped if approved first time
+        - node: severity-gate
+      config:
+        mode: expression
+        expression: |
+          ${{
+            nodes.human-review.outputs.action_result.decision == 'approve' ||
+            nodes.changes-loop.outputs.final_decision == 'approve'
+          }}
+        outputs_on_pass:
+          merge_allowed: true
+        outputs_on_fail:
+          merge_allowed: false
+          block_reason: "Review not approved"
+
+    # ═══ STAGE 9: Post-Merge Notification ═════════════════════════════════════
+    - id: notify-complete
+      type: trigger
+      label: "Review Complete Notification"
+      depends_on:
+        - node: merge-gate
+      config:
+        direction: outbound
+        event_type: code_review.completed
+        payload:
+          pr_number: ${{ variables.pr_number }}
+          decision: ${{ nodes.merge-gate.outputs.merge_allowed ? 'approved' : 'rejected' }}
+          findings_count: ${{ len(nodes.aggregate-findings.outputs.all_findings) }}
+          review_duration_m: ${{ duration(workflow.started_at, now()) / 60000 }}
+          reviewers: ["security-agent", "performance-agent", "style-agent", "correctness-agent", "human"]
+        target: "webhook:${{ secrets.REVIEW_WEBHOOK_URL }}"

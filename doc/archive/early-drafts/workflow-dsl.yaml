@@ -1,0 +1,359 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Witness Workflow DSL — Schema Definition
+# ═══════════════════════════════════════════════════════════════════════════════
+# Version: 1.0.0
+# Format: YAML (human-readable, git-friendly, diffable)
+# Runtime: FastAPI backend validates + executes; Vite+TS frontend visualizes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 1. TOP-LEVEL WORKFLOW METADATA                                              │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+workflow:
+  # ── Identity ──────────────────────────────────────────────────────────────
+  id: string                          # Globally unique. Format: org/name or slug. Required.
+  name: string                        # Human-readable display name. Required.
+  version: string                     # SemVer. Required for templates; auto-incremented for detected workflows.
+  description: string                 # Optional. Markdown supported.
+  author: string                      # Optional. Who created the template.
+  tags: [string]                      # Optional. For filtering/search: ["deploy", "ci", "microservice"]
+  created_at: iso8601                 # Auto-populated on creation.
+  updated_at: iso8601                 # Auto-populated on modification.
+
+  # ── Workflow Origin ───────────────────────────────────────────────────────
+  # How this workflow came into existence:
+  origin: enum                        # 'defined' | 'detected' | 'hybrid'
+    # defined  — fully authored in YAML by a human
+    # detected — inferred at runtime from observed AgentRun topology (TopologyEdge)
+    # hybrid   — YAML template with expandable nodes that agents fill at runtime
+
+  # ── Triggers ──────────────────────────────────────────────────────────────
+  # What causes this workflow to start. Multiple triggers = OR (any one fires it).
+  triggers:
+    - type: enum                      # 'git_push' | 'git_pr' | 'schedule' | 'webhook' | 'manual' | 'agent_event' | 'file_change'
+      config:                         # Type-specific configuration:
+        # git_push:
+        branches: [string]            #   Branch patterns: ["main", "release/*"]
+        paths: [string]               #   File path filters: ["src/**", "!docs/**"]
+        # git_pr:
+        actions: [string]             #   PR events: ["opened", "synchronize", "merged"]
+        base_branches: [string]       #   Target branch filter
+        labels: [string]              #   Required labels
+        # schedule:
+        cron: string                  #   Cron expression: "0 2 * * *"
+        timezone: string              #   IANA timezone: "America/New_York"
+        # webhook:
+        path: string                  #   Endpoint path: "/hooks/deploy"
+        secret_ref: string            #   Secret for HMAC validation
+        # manual:
+        inputs: map                   #   Form fields shown to user on manual trigger
+        # agent_event:
+        event_kind: string            #   AgentEvent kind to watch: "run_ended"
+        filter: expression            #   Condition: ${{ event.data.endReason == 'completed' }}
+        # file_change:
+        watch_paths: [string]         #   Paths to monitor: ["config/*.yaml"]
+        debounce_ms: integer          #   Debounce period: 5000
+      condition: expression           # Optional guard: ${{ trigger.branch != 'experimental' }}
+
+  # ── Variables ─────────────────────────────────────────────────────────────
+  # Workflow-scoped variables. Can be set by triggers, overridden at runtime, read by nodes.
+  variables:
+    <variable_name>:
+      type: enum                      # 'string' | 'number' | 'boolean' | 'object' | 'array' | 'secret'
+      default: any                    # Default value. Optional.
+      required: boolean               # If true, workflow won't start without this value.
+      description: string             # Documentation for the variable.
+      enum: [any]                     # Optional allowed values.
+      sensitive: boolean              # If true, value masked in logs/UI. Auto-true for type:secret.
+
+  # ── Defaults ──────────────────────────────────────────────────────────────
+  # Default configuration applied to all nodes unless overridden at node level.
+  defaults:
+    timeout: duration                 # Default node timeout: "30m", "1h", "never"
+    retry:
+      max_attempts: integer           # Default retries: 3
+      backoff: enum                   # 'fixed' | 'linear' | 'exponential'
+      delay: duration                 # Initial delay: "10s"
+      max_delay: duration             # Cap for exponential: "5m"
+      retry_on: [string]             # Error types to retry: ["timeout", "transient"]
+    agent:                            # Default agent configuration
+      source: string                  # Default agent source: "claude-code"
+      model: string                   # Default model: "claude-sonnet-4-20250514"
+      permission_mode: enum           # 'default' | 'plan' | 'auto' | 'yolo'
+      max_turns: integer              # Default max turns: 50
+      cost_limit_usd: number          # Default cost cap: 5.00
+    notification:
+      channels: [string]             # Default notification targets: ["slack:#deploys"]
+
+  # ── Error Handling ────────────────────────────────────────────────────────
+  on_failure:
+    strategy: enum                    # 'abort' | 'continue' | 'pause' | 'rollback'
+    fallback_workflow: string          # Optional: workflow_ref to run on failure
+    notification:
+      channels: [string]
+      message: string                 # Template: "Workflow {{workflow.name}} failed at {{failed_node.label}}"
+    cleanup_nodes: [string]           # Node IDs to run as cleanup regardless of failure
+
+  # ── Concurrency ───────────────────────────────────────────────────────────
+  concurrency:
+    group: string                     # Concurrency group key: "deploy-{{variables.service_name}}"
+    strategy: enum                    # 'queue' | 'cancel_previous' | 'reject'
+    max_parallel: integer             # Max concurrent executions in this group: 1
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 2. NODE SCHEMA                                                              │
+# └─────────────────────────────────────────────────────────────────────────────┘
+# Nodes are the vertices of the workflow DAG.
+
+  nodes:
+    - # ── Common Fields (all node types) ──────────────────────────────────────
+      id: string                      # Unique within workflow. Slug format: "build-image"
+      type: enum                      # Node type discriminator (see below)
+        # 'agent_task'         — an AI agent performs work
+        # 'human_checkpoint'   — requires human action/approval
+        # 'trigger'            — waits for or fires an external event
+        # 'subworkflow'        — invokes another workflow as a unit
+        # 'gate'               — conditional/join logic, no work
+        # 'wait'               — time delay or event wait
+      label: string                   # Display name: "Build Docker Image"
+      description: string             # Optional longer description (markdown)
+
+      # ── Dependencies & Edges ────────────────────────────────────────────────
+      depends_on:                      # List of upstream dependencies
+        - string                       # Simple form: just a node_id (implies join:all, wait for completion)
+        - node: string                 # Extended form:
+          join: enum                   #   'all' (default) | 'any' | 'n_of_m'
+          n: integer                   #   Required when join is 'n_of_m': minimum completions
+          status: enum                 #   Which status satisfies: 'completed' (default) | 'any_terminal' | 'failed'
+          output: string               #   Specific output field to wait for (data dependency)
+
+      blocks: [string]                 # Node IDs this node blocks (reverse edge, for visualization)
+      triggers_nodes: [string]        # Fire-and-forget: start these nodes without waiting
+
+      # ── Data Flow ───────────────────────────────────────────────────────────
+      inputs:                          # Data this node receives
+        <param_name>:
+          from: expression             # Source: ${{ nodes.build.outputs.image_tag }}
+          default: any                 # Fallback if source unavailable
+          required: boolean            # Fail node if not available
+
+      outputs:                         # Data this node produces (available to downstream)
+        <output_name>:
+          type: enum                   # Expected type for validation
+          description: string
+
+      # ── Conditions ──────────────────────────────────────────────────────────
+      conditions:
+        when: expression               # Run only if true: ${{ variables.deploy_env == 'production' }}
+        unless: expression             # Skip if true (syntactic sugar for !when)
+        skip_reason: string            # Message shown when skipped: "Skipped: not a production deploy"
+
+      # ── Lifecycle Configuration ─────────────────────────────────────────────
+      timeout: duration                # Override default: "45m"
+      retry:                           # Override default retry policy
+        max_attempts: integer
+        backoff: enum
+        delay: duration
+        retry_on: [string]
+        on_exhaust: enum               # 'fail' | 'skip' | 'fallback'
+        fallback_node: string          # Node to run if retries exhausted
+
+      # ── Runtime Augmentation ────────────────────────────────────────────────
+      augmentable: boolean             # If true, agents can inject child nodes here at runtime
+      injection_rules:                 # Constraints on what can be injected (only when augmentable:true)
+        max_children: integer          # Max injected nodes: 20
+        allowed_types: [enum]          # Allowed node types: ["agent_task", "gate"]
+        auto_approve: boolean          # If true, injected nodes start immediately
+        requires_approval_from: string # Approver if not auto: "admin" or node_id of human_checkpoint
+        allowed_sources: [string]      # Which agent sources can augment: ["claude-code"]
+        cost_budget_usd: number        # Total cost budget for all injected children
+        inherit_timeout: boolean       # Injected nodes inherit parent timeout
+
+      # ── Metadata ────────────────────────────────────────────────────────────
+      tags: [string]                   # For filtering: ["critical-path", "parallelizable"]
+      annotations:                     # Free-form metadata for tooling/visualization
+        <key>: any
+      priority: enum                   # 'critical' | 'high' | 'normal' | 'low' — affects scheduling
+
+      # ── Agent Run Binding ───────────────────────────────────────────────────
+      # Links this node to observed AgentRuns (for detected/hybrid workflows)
+      bound_run:
+        run_id: string                 # Specific AgentRun.id bound to this node
+        match_criteria:                # Or match by criteria (for templates)
+          source: string               # Agent source filter
+          workspace_pattern: string    # cwd glob
+          title_pattern: string        # Regex on AgentRun.title
+          spawn_kind: enum             # Filter by SpawnKind
+
+      # ════════════════════════════════════════════════════════════════════════
+      # TYPE-SPECIFIC CONFIG
+      # ════════════════════════════════════════════════════════════════════════
+      config:
+
+        # ── agent_task ────────────────────────────────────────────────────────
+        # An AI coding agent performs a task.
+        agent_source: string           # Which agent: "claude-code" | "codex" | "hermes" | "opencode"
+        model: string                  # Model to use: "claude-opus-4-20250514"
+        prompt: string                 # Task instruction (markdown). Supports variable interpolation.
+        system_prompt: string          # Optional system prompt override
+        tools_allowed: [string]        # Tool whitelist: ["bash", "edit", "read"]. Empty = all.
+        tools_denied: [string]         # Tool blacklist: ["web_search"]. Overrides allowed.
+        permission_mode: enum          # 'default' | 'plan' | 'auto' | 'yolo'
+        workspace:
+          cwd: string                  # Working directory: ${{ variables.repo_path }}
+          git_branch: string           # Branch to work on
+          git_repo: string             # Repository URL/path
+        max_turns: integer             # Max conversation turns: 100
+        cost_limit_usd: number         # Cost cap for this task: 10.00
+        files_context: [string]        # Files to pre-load as context
+        environment:                   # Env vars to set
+          <key>: string
+        artifacts:                     # Files/outputs to capture after completion
+          - path: string               # Glob or exact path
+            name: string               # Output name to register
+
+        # ── human_checkpoint ──────────────────────────────────────────────────
+        # Pauses workflow until a human takes action.
+        assignee: string               # Who should act: username, role, or "pr_author"
+        message: string                # What to show: "Review deployment plan for {{variables.service}}"
+        context_nodes: [string]        # Show outputs from these nodes for context
+        actions:                       # Available actions (at least one required)
+          - id: string                 # Action identifier: "approve"
+            label: string              # Button text: "Approve Deploy"
+            style: enum                # UI hint: 'primary' | 'danger' | 'default'
+            requires_comment: boolean  # Force a comment with this action
+            transitions_to: enum       # Node state after action: 'completed' | 'failed' | 'skipped'
+            output_value: any          # Value stored in outputs.action_result
+        timeout_action: enum           # What happens on timeout: 'approve' | 'reject' | 'escalate' | 'abort'
+        escalation:
+          after: duration              # Escalate after: "4h"
+          to: string                   # Escalation target: "team-lead"
+        notification:
+          channels: [string]           # Where to notify: ["slack:#approvals", "email:ops@co.com"]
+          remind_after: duration       # Reminder interval: "1h"
+
+        # ── trigger ───────────────────────────────────────────────────────────
+        # Waits for an external event or fires an outbound event.
+        direction: enum                # 'inbound' (wait) | 'outbound' (fire)
+        event_type: string             # Event identifier: "deployment.completed"
+        # inbound:
+        filter: map                    # Match criteria on event payload
+        timeout: duration              # How long to wait: "1h"
+        timeout_action: enum           # On timeout: 'skip' | 'fail' | 'default_value'
+        default_value: any             # Output value if timed out
+        # outbound:
+        payload: map                   # Event payload to emit (supports expressions)
+        target: string                 # Target system: "webhook:https://..." | "pubsub:topic"
+
+        # ── subworkflow ───────────────────────────────────────────────────────
+        # Invokes another workflow definition.
+        workflow_ref: string            # Reference: "path/to/workflow.yaml" or "registry/workflow-id"
+        version: string                # Version constraint: "^1.0.0" or "latest"
+        input_mapping:                 # Map parent variables/outputs to child inputs
+          <child_var>: expression      # ${{ nodes.build.outputs.artifact_id }}
+        output_mapping:                # Map child outputs back to this node's outputs
+          <output_name>: string        # Child output path: "child.nodes.deploy.outputs.url"
+        inherit_variables: boolean     # Pass all parent variables to child: false
+        isolated: boolean              # Run in isolated context (no shared state): true
+        on_failure: enum               # 'fail_parent' | 'skip' | 'retry'
+
+        # ── gate ──────────────────────────────────────────────────────────────
+        # Pure logic node: evaluates conditions, produces no side effects.
+        mode: enum                     # 'all_of' | 'any_of' | 'none_of' | 'expression' | 'vote'
+        conditions:                    # For all_of/any_of/none_of:
+          - expression                 # ${{ nodes.unit_tests.status == 'completed' }}
+        expression: string             # For mode:expression — arbitrary boolean expression
+        vote:                          # For mode:vote
+          threshold: number            # Fraction required: 0.67
+          voters: [string]             # Node IDs whose outputs are votes
+          field: string                # Output field to read: "approved"
+        outputs_on_pass:               # Values to set when gate passes
+          <key>: any
+        outputs_on_fail:               # Values to set when gate fails
+          <key>: any
+
+        # ── wait ──────────────────────────────────────────────────────────────
+        # Introduces a delay or waits for a condition.
+        duration: duration             # Fixed wait: "5m", "1h"
+        until_time: expression         # Wait until: ${{ nodes.deploy.outputs.scheduled_time }}
+        until_condition: expression    # Poll until true: ${{ nodes.health.outputs.healthy == true }}
+        poll_interval: duration        # How often to check condition: "30s"
+        max_wait: duration             # Give up after: "30m"
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 3. EXPRESSION LANGUAGE                                                      │
+# └─────────────────────────────────────────────────────────────────────────────┘
+# Expressions use ${{ }} delimiters. Available contexts:
+#
+# ${{ nodes.<id>.status }}           — Node status: 'completed', 'failed', etc.
+# ${{ nodes.<id>.outputs.<name> }}   — Node output value
+# ${{ nodes.<id>.started_at }}       — Timestamp
+# ${{ nodes.<id>.duration_ms }}      — How long the node ran
+# ${{ workflow.variables.<name> }}   — Workflow variable
+# ${{ workflow.id }}                  — Current workflow instance ID
+# ${{ workflow.run_number }}          — Execution counter
+# ${{ trigger.type }}                — What triggered this run
+# ${{ trigger.payload.<field> }}     — Trigger event data
+# ${{ env.<name> }}                  — Environment variable
+# ${{ secrets.<name> }}              — Secret reference (resolved at runtime)
+# ${{ now() }}                       — Current timestamp (epoch ms)
+# ${{ duration(nodes.X.started_at, now()) }} — Elapsed time
+#
+# Operators: ==, !=, <, >, <=, >=, &&, ||, !, in, not_in, matches (regex)
+# Functions: contains(), starts_with(), ends_with(), len(), json_path(), coalesce()
+# Ternary: ${{ condition ? value_if_true : value_if_false }}
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 4. STATE MACHINES                                                           │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+# ── Workflow States ───────────────────────────────────────────────────────────
+# created → running → completed
+#                   → failed
+#                   → cancelled
+# created → cancelled (before start)
+# running → paused → running (resume)
+# running → paused → cancelled
+#
+# Transitions:
+#   created → running:    trigger fires or manual start
+#   running → completed:  all terminal nodes reached terminal state
+#   running → failed:     on_failure.strategy == 'abort' and a node failed
+#   running → paused:     human pause or awaiting augmentation approval
+#   running → cancelled:  user cancellation
+#   paused  → running:    resume command or approval granted
+
+# ── Node States ───────────────────────────────────────────────────────────────
+# pending → ready → queued → running → completed
+#                                     → failed → (retry) → queued
+#                                     → cancelled
+# pending → skipped (condition false or upstream skip-propagation)
+# running → waiting_approval → completed | failed (for human_checkpoint)
+# ready → cancelled (workflow cancelled)
+#
+# Transitions:
+#   pending → ready:             all depends_on satisfied (per join mode)
+#   pending → skipped:           conditions.when evaluates false, or skip-propagation
+#   ready → queued:              scheduler picks it up
+#   queued → running:            execution begins (agent spawned, etc.)
+#   running → completed:         task succeeds, outputs captured
+#   running → failed:            task errors (may trigger retry)
+#   running → waiting_approval:  human_checkpoint awaiting action
+#   failed → queued:             retry triggered (attempts remaining)
+#   failed → skipped:            retry.on_exhaust == 'skip'
+#   * → cancelled:               workflow cancellation propagates
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ 5. RUNTIME AUGMENTATION                                                     │
+# └─────────────────────────────────────────────────────────────────────────────┘
+# Nodes marked augmentable:true can have child nodes injected at runtime.
+# This enables:
+#   - Agent discovers subtasks (e.g., finds 12 test suites, creates a node per suite)
+#   - Detected workflows grow as new AgentRuns are observed
+#   - Hybrid templates where agents fill in specifics
+#
+# See section 4 of the companion document for full augmentation protocol.
