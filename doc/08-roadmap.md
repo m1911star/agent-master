@@ -20,23 +20,23 @@
 
 ### 里程碑 M1.1 · daemon 骨架（1 周）
 
-- [ ] 项目脚手架（uv init）
-- [ ] FastAPI app + healthcheck
-- [ ] SQLite + 迁移 runner
-- [ ] 基础日志（structlog）
-- [ ] CLI 入口（`agent-master start`）
-- [ ] 配置文件加载（toml）
+- [x] 项目脚手架（uv init）
+- [x] FastAPI app + healthcheck
+- [x] SQLite + 迁移 runner
+- [x] 基础日志（structlog）
+- [x] CLI 入口（`agent-master start`）
+- [x] 配置文件加载（toml）
 
-**验收：** `agent-master start` 起来，访问 `/api/health` 返回 ok。
+**验收：** `agent-master start` 起来，访问 `/api/health` 返回 ok。 ✅ 完成（commit `dbba843..22c91be`）
 
 ### 里程碑 M1.2 · 数据层 + adapter 抽象（1 周）
 
-- [ ] 数据模型 ORM-less 实现（dataclass + 手写 SQL）
-- [ ] 7 个核心对象 schema 上线
-- [ ] AdapterRegistry / Observer 基类
-- [ ] 跨平台 watcher 抽象（fsevents/inotify/polling）
+- [x] 数据模型 ORM-less 实现（dataclass + 手写 SQL）
+- [x] 7 个核心对象 schema 上线
+- [x] AdapterRegistry / Observer 基类
+- [x] 跨平台 watcher 抽象（fsevents/inotify/polling）
 
-**验收：** 单元测试覆盖 7 个对象的 CRUD。
+**验收：** 单元测试覆盖 7 个对象的 CRUD。 ✅ 48 tests / 81% coverage（commit `02d62ad..e70ba3c`）
 
 ### 里程碑 M1.3 · 三个 Adapter（2 周）
 
