@@ -20,7 +20,7 @@ SessionStatus = str
 @dataclass
 class Session:
     agent_id: str
-    workdir: str
+    workdir: str = ""
     id: str = field(default_factory=new_id)
     external_id: str | None = None
     parent_session_id: str | None = None

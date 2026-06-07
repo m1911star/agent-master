@@ -12,8 +12,8 @@ def test_migrate_applies_all_and_is_idempotent(tmp_path: Path):
 
     with connect(db_path) as conn:
         applied = migrate(conn)
-        # 001 placeholder + 002 core schema
-        assert applied == [1, 2]
+        # 001 placeholder + 002 core schema + 003 budget timestamps
+        assert applied == [1, 2, 3]
         # WAL mode confirmed
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode.lower() == "wal"
@@ -26,7 +26,7 @@ def test_migrate_applies_all_and_is_idempotent(tmp_path: Path):
         applied = migrate(conn)
         assert applied == []
         rows = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-        assert [r[0] for r in rows] == [1, 2]
+        assert [r[0] for r in rows] == [1, 2, 3]
 
 
 def test_002_creates_all_11_tables(tmp_path: Path):
