@@ -43,8 +43,8 @@ EventKind = str
 @dataclass
 class Event:
     run_id: str
-    seq: int
     kind: EventKind
+    seq: int = 0  # 0 = "please auto-assign at persist time" (EventPipeline does this)
     id: int | None = None  # assigned by DB on insert
     ts: datetime = field(default_factory=utcnow)
     created_at: datetime = field(default_factory=utcnow)
