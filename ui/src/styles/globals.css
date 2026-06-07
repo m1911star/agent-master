@@ -1,0 +1,171 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────────────────────────────
+ * AGENT//MASTER — Cyberpunk × Cosmic Sci-Fi design tokens.
+ *
+ * Aesthetic anchor:
+ *   - deep void background (near-black, slight blue cast like deep space)
+ *   - holographic accents: cyan/magenta/violet — CRT phosphor + nebula
+ *   - amber/electric green for system status (HUD-style)
+ *   - thin scanlines + corner brackets (LCARS / Apollo MCC vibe)
+ *   - Orbitron for titles (sci-fi block), Rajdhani for UI, JetBrains Mono for data
+ * ───────────────────────────────────────────────────────────────────── */
+
+@theme {
+  /* ── core background palette ────────────────────────────────── */
+  --color-bg-deep:     #04060f;   /* deep space */
+  --color-bg-void:     #0a0d1a;   /* panel base */
+  --color-bg-elev:     #131829;   /* elevated card */
+  --color-bg-glass:    rgba(20, 28, 54, 0.55);
+
+  /* ── borders / grid lines ───────────────────────────────────── */
+  --color-line-dim:    #1c2440;
+  --color-line:        #2a3560;
+  --color-line-hot:    #3d4d8c;
+
+  /* ── text ───────────────────────────────────────────────────── */
+  --color-fg:          #d8e0f5;
+  --color-fg-dim:      #8893b8;
+  --color-fg-mute:     #4d5778;
+
+  /* ── neon accents (CRT phosphor + nebula) ───────────────────── */
+  --color-neon-cyan:   #5cfffe;
+  --color-neon-mag:    #ff44d4;
+  --color-neon-vlt:    #a155ff;
+  --color-neon-pink:   #ff5e88;
+
+  /* ── HUD / status (deliberately desaturated vs neons) ───────── */
+  --color-hud-amber:   #ffb84a;
+  --color-hud-green:   #5ef0a8;
+  --color-hud-red:     #ff5e5e;
+  --color-hud-blue:    #5ea8ff;
+
+  /* ── status semantic mapping (Agent / Run status) ───────────── */
+  --color-status-active:  var(--color-hud-green);
+  --color-status-idle:    var(--color-fg-mute);
+  --color-status-busy:    var(--color-neon-cyan);
+  --color-status-error:   var(--color-hud-red);
+  --color-status-paused:  var(--color-neon-vlt);
+  --color-status-pending: var(--color-hud-amber);
+
+  /* ── fonts ──────────────────────────────────────────────────── */
+  --font-display: "Orbitron", "Rajdhani", system-ui, sans-serif;
+  --font-sans:    "Rajdhani", system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", "SF Mono", Menlo, monospace;
+}
+
+/* ── global resets ──────────────────────────────────────────── */
+html, body, #root { height: 100%; }
+body {
+  font-family: var(--font-sans);
+  color: var(--color-fg);
+  background: var(--color-bg-deep);
+  font-feature-settings: "cv11", "ss01", "ss03";
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── space backdrop: starfield + nebula glow ────────────────── */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    /* nebula 1: cyan top-left */
+    radial-gradient(ellipse 60% 50% at 15% 15%, rgba(92, 255, 254, 0.06), transparent 60%),
+    /* nebula 2: magenta bottom-right */
+    radial-gradient(ellipse 50% 60% at 85% 80%, rgba(255, 68, 212, 0.05), transparent 60%),
+    /* nebula 3: violet center */
+    radial-gradient(ellipse 80% 50% at 50% 50%, rgba(161, 85, 255, 0.03), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+body::after {
+  /* faint hex-grid overlay */
+  content: "";
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(42, 53, 96, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(42, 53, 96, 0.08) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+  z-index: 0;
+  mask-image: radial-gradient(ellipse at center, black 30%, transparent 90%);
+}
+
+#root { position: relative; z-index: 1; }
+
+/* ── scanline overlay (subtle, CRT) ─────────────────────────── */
+.scanlines {
+  position: relative;
+  isolation: isolate;
+}
+.scanlines::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0) 2px,
+    rgba(92, 255, 254, 0.025) 2px,
+    rgba(92, 255, 254, 0.025) 3px
+  );
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+
+/* ── neon glow utility ──────────────────────────────────────── */
+.glow-cyan  { text-shadow: 0 0 8px var(--color-neon-cyan), 0 0 24px rgba(92, 255, 254, 0.4); }
+.glow-mag   { text-shadow: 0 0 8px var(--color-neon-mag),  0 0 24px rgba(255, 68, 212, 0.4); }
+.glow-vlt   { text-shadow: 0 0 8px var(--color-neon-vlt),  0 0 24px rgba(161, 85, 255, 0.4); }
+.glow-amber { text-shadow: 0 0 6px var(--color-hud-amber), 0 0 16px rgba(255, 184, 74, 0.4); }
+.glow-green { text-shadow: 0 0 6px var(--color-hud-green), 0 0 16px rgba(94, 240, 168, 0.4); }
+.glow-red   { text-shadow: 0 0 6px var(--color-hud-red),   0 0 16px rgba(255, 94, 94, 0.4); }
+
+/* ── corner-bracket frame (HUD panel) ───────────────────────── */
+.brackets {
+  position: relative;
+}
+.brackets::before,
+.brackets::after,
+.brackets > .br-bl,
+.brackets > .br-br {
+  content: "";
+  position: absolute;
+  width: 14px; height: 14px;
+  border-color: var(--color-neon-cyan);
+  border-style: solid;
+  border-width: 0;
+  pointer-events: none;
+  opacity: 0.85;
+}
+.brackets::before { top: -1px; left: -1px;    border-top-width: 1px; border-left-width: 1px; }
+.brackets::after  { top: -1px; right: -1px;   border-top-width: 1px; border-right-width: 1px; }
+.brackets > .br-bl { bottom: -1px; left: -1px;  border-bottom-width: 1px; border-left-width: 1px; }
+.brackets > .br-br { bottom: -1px; right: -1px; border-bottom-width: 1px; border-right-width: 1px; }
+
+/* ── pulse-dot for "live" indicators ────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1;   box-shadow: 0 0 0 0 currentColor; }
+  50%      { opacity: 0.6; box-shadow: 0 0 0 6px transparent; }
+}
+.pulse { animation: pulse-dot 1.4s ease-in-out infinite; }
+
+/* ── ticker scroll (data marquee) ───────────────────────────── */
+@keyframes tick-scroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.tick { animation: tick-scroll 40s linear infinite; }
+
+/* ── selection ──────────────────────────────────────────────── */
+::selection { background: var(--color-neon-cyan); color: var(--color-bg-deep); }
+
+/* ── scrollbar ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-line-hot); }

@@ -28,6 +28,14 @@ events.db
 events.db-*
 *.log
 
+# Dev runtime (alt port config, scratch db)
+dev/state.db
+dev/state.db-*
+dev/*.log
+
+# Playwright traces from dogfooding sessions
+.playwright-mcp/
+
 # Test / build / cache
 .pytest_cache/
 .ruff_cache/
@@ -37,3 +45,4 @@ htmlcov/
 .coverage.*
 dist/
 build/
+.commit-msg-tmp

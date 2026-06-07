@@ -1,0 +1,22 @@
+# Build output
+dist/
+node_modules/
+*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+
+# TS incremental build cache
+*.tsbuildinfo
+
+# OS
+.DS_Store

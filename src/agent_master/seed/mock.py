@@ -136,7 +136,9 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             last_active_at=now - timedelta(seconds=30),
             status="active",
             summary="Implementing the M1.5 UI scaffolding",
-            meta={"model": "claude-opus-4.7", "cost": 0.42},
+            meta={"model": "claude-opus-4.7", "cost": 0.42,
+                  "tokens_input": 12_400, "tokens_output": 3_200,
+                  "message_count": 18},
         ))
 
         # 2 child sessions (sidechain-style)
@@ -149,7 +151,9 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             last_active_at=now - timedelta(minutes=2),
             status="active",
             summary="Spawned: code review of new components",
-            meta={"model": "claude-haiku-4.5"},
+            meta={"model": "claude-haiku-4.5", "cost": 0.08,
+                  "tokens_input": 4_800, "tokens_output": 1_200,
+                  "message_count": 9},
         ))
         s_child2 = srepo.create(Session(
             agent_id=agents["hermes"].id,
@@ -160,7 +164,9 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             last_active_at=now - timedelta(seconds=10),
             status="active",
             summary="Spawned: running the test suite",
-            meta={"source": "cli"},
+            meta={"source": "cli", "cost": 0.05,
+                  "tokens_input": 2_400, "tokens_output": 600,
+                  "message_count": 6},
         ))
 
         # Idle session
@@ -172,6 +178,8 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             last_active_at=now - timedelta(minutes=20),
             status="idle",
             summary="Earlier: drafted the weekly notes",
+            meta={"cost": 0.18, "tokens_input": 8_200,
+                  "tokens_output": 1_800, "message_count": 14},
         ))
 
         # 2 closed sessions
@@ -184,6 +192,8 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             ended_at=now - timedelta(hours=3, minutes=15),
             status="closed",
             summary="Closed: shipped the OAuth migration PR",
+            meta={"cost": 1.24, "tokens_input": 42_000,
+                  "tokens_output": 8_800, "message_count": 47},
         ))
         s_closed2 = srepo.create(Session(
             agent_id=agents["opencode"].id,
@@ -194,6 +204,8 @@ def seed_mock_data(db_path: Path, *, reset: bool = False) -> dict:
             ended_at=now - timedelta(hours=5),
             status="closed",
             summary="Closed: investigated the perf regression (root cause found)",
+            meta={"cost": 0.62, "tokens_input": 18_500,
+                  "tokens_output": 4_100, "message_count": 26},
         ))
 
         sessions = [s_parent, s_child1, s_child2, s_idle, s_closed1, s_closed2]

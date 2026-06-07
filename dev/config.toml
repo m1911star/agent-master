@@ -1,0 +1,17 @@
+# Dev settings for agent-master
+# Run on alt port (8765 is taken by hermes-conductor on this machine).
+# To use: AGENT_MASTER_CONFIG_HOME=$PWD/dev uv run agent-master start
+[daemon]
+host = "127.0.0.1"
+port = 18765
+log_level = "info"
+
+[storage]
+db_path = "/Users/horus/sideproject/agent-master/dev/state.db"
+backup_retention_days = 7
+
+[ui]
+auto_open_browser = false
+
+[adapters]
+enabled = []

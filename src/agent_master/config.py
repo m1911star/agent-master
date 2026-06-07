@@ -15,7 +15,9 @@ from typing import Any
 
 import tomli_w
 
-DEFAULT_CONFIG_HOME = Path("~/.agent-master").expanduser()
+DEFAULT_CONFIG_HOME = Path(
+    os.environ.get("AGENT_MASTER_CONFIG_HOME") or "~/.agent-master"
+).expanduser()
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_HOME / "config.toml"
 
 
