@@ -40,12 +40,12 @@
 
 ### 里程碑 M1.3 · 三个 Adapter（2 周）
 
-- [ ] OpenCode adapter（schema 最干净，作为 reference 实现 — session/message/part/event + parent_id 全直给）
-- [ ] Hermes adapter（spike 已验证 WAL tail 路径，复用代码）
-- [ ] Claude Code adapter
-- [ ] 每个 adapter 的 fixture + 单元测试
+- [x] OpenCode adapter（schema 最干净，作为 reference 实现 — session/message/part/event + parent_id 全直给）
+- [x] Hermes adapter（spike 已验证 WAL tail 路径，复用代码）
+- [x] Claude Code adapter
+- [x] 每个 adapter 的 fixture + 单元测试
 
-**验收：** daemon 起来，看到 ~/.local/share/opencode ~/.claude ~/.hermes 的 session 都被发现。
+**验收：** daemon 起来，看到 ~/.local/share/opencode ~/.claude ~/.hermes 的 session 都被发现。 ✅ 完成（commit `1fffead..0d38a6f`，65 tests 全绿，3 个 adapter 都用真实 DB smoke 验证过）
 
 ### 里程碑 M1.4 · 事件流 + SSE（1 周）
 
