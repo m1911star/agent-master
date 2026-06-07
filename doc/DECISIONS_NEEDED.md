@@ -41,3 +41,14 @@ Real OpenCode DB stores `session.model` as JSON like
 not as a flat string like our fixture assumed. Adapter still works
 (stored as opaque text in meta), but if the UI wants "model name" it
 needs to parse `meta.model` as JSON first. Document for M1.5 UI.
+
+## [M1.5 / V0.4] Rule model missing `reason` field
+
+doc/05-hitl.md spec'd Rule with a `reason: text?` field ("用户备注
+\"为什么这样配置\"") but the dataclass + 002_core_schema.sql don't have
+it. Mock data seeding had to drop the reason field to compile. When
+V0.4 HITL lands, add:
+  - models/rule.py: `reason: str | None = None`
+  - migration 004: `ALTER TABLE rules ADD COLUMN reason TEXT;`
+  - update Rule.from_row / to_row / to_dict to carry it
+Until then the rules table works fine without it.

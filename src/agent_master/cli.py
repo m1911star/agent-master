@@ -80,6 +80,30 @@ def config_path() -> None:
     click.echo(str(DEFAULT_CONFIG_PATH))
 
 
+@cli.command()
+@click.option(
+    "--reset",
+    is_flag=True,
+    default=False,
+    help="Wipe existing data first (so seed is the only thing in the DB).",
+)
+def seed(reset: bool) -> None:
+    """Populate the daemon's DB with realistic mock data for UI development.
+
+    Idempotent without --reset (additive), wipe-and-reseed with --reset.
+    """
+    from pathlib import Path
+    from .seed import seed_mock_data
+
+    cfg = load_config()
+    db_path = Path(cfg.storage.db_path).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    summary = seed_mock_data(db_path, reset=reset)
+    click.echo(f"seeded {db_path}:")
+    for key, val in summary.items():
+        click.echo(f"  {key}: {val}")
+
+
 def main() -> None:
     cli()
 
