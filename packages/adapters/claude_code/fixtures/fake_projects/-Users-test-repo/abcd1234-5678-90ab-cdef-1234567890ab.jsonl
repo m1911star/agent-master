@@ -1,0 +1,7 @@
+{"type": "last-prompt", "leafUuid": "aaa", "sessionId": "abcd1234-5678-90ab-cdef-1234567890ab"}
+{"type": "permission-mode", "permissionMode": "default", "sessionId": "abcd1234-5678-90ab-cdef-1234567890ab"}
+{"parentUuid": null, "isSidechain": false, "attachment": {"type": "hook_success", "hookName": "SessionStart:startup", "toolUseID": "hook1", "hookEvent": "SessionStart", "content": ""}, "timestamp": "2026-06-07T10:00:00Z"}
+{"role": "user", "message": {"role": "user", "content": "Refactor src/foo.ts"}, "timestamp": "2026-06-07T10:00:01Z"}
+{"role": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Let me check the file first."}, {"type": "tool_use", "id": "tool_1", "name": "Read", "input": {"file_path": "src/foo.ts"}}]}, "timestamp": "2026-06-07T10:00:02Z"}
+{"role": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool_1", "content": "file contents..."}]}, "timestamp": "2026-06-07T10:00:03Z"}
+{"role": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Here's the refactor plan..."}]}, "timestamp": "2026-06-07T10:00:04Z"}

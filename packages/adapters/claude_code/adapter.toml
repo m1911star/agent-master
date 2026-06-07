@@ -1,0 +1,14 @@
+[adapter]
+name = "claude_code"
+version = "0.1.0"
+display_name = "Claude Code"
+
+[capabilities]
+observer = true
+controller = false
+approver = false
+
+[observer]
+projects_dir = "~/.claude/projects"
+poll_fallback_ms = 1000
+recent_hours = 24
