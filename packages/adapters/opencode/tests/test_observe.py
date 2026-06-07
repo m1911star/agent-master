@@ -13,12 +13,13 @@ from pathlib import Path
 
 import pytest
 
-# Adapter packages aren't installed; add their dir to sys.path.
-ADAPTER_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ADAPTER_DIR.parent.parent.parent))  # repo root
-sys.path.insert(0, str(ADAPTER_DIR))  # for `import observe`
+from packages.adapters.opencode.observe import (
+    OpenCodeObserver,
+    PART_TYPE_TO_KIND,
+    _summarize_part,
+)
 
-from observe import OpenCodeObserver, PART_TYPE_TO_KIND, _summarize_part
+ADAPTER_DIR = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="module")

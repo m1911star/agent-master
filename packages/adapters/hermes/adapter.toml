@@ -1,0 +1,14 @@
+[adapter]
+name = "hermes"
+version = "0.1.0"
+display_name = "Hermes"
+
+[capabilities]
+observer = true
+controller = false
+approver = false
+
+[observer]
+db_path = "~/.hermes/state.db"
+poll_interval_ms = 200
+recent_hours = 24
