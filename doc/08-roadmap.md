@@ -49,11 +49,11 @@
 
 ### 里程碑 M1.4 · 事件流 + SSE（1 周）
 
-- [ ] Event Pipeline（防抖、持久化、fanout）
-- [ ] SSE endpoint
-- [ ] DebouncedFanout 实现
+- [x] Event Pipeline（防抖、持久化、fanout）
+- [x] SSE endpoint
+- [x] DebouncedFanout 实现
 
-**验收：** curl SSE 端点，触发一个 claude code 操作，看到事件实时流出。
+**验收：** curl SSE 端点，触发一个 claude code 操作，看到事件实时流出。 ✅ 完成（commit `fb2b7ee..` ，scripts/smoke_real_daemon.py 端到端验证通过）
 
 ### 里程碑 M1.5 · UI MVP（2 周）
 

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from agent_master import __version__
 from agent_master.api.app import create_app
 
 
-def test_health_returns_ok_and_version():
-    client = TestClient(create_app())
+def test_health_returns_ok_and_version(tmp_path: Path):
+    client = TestClient(create_app(db_path=tmp_path / "state.db"))
     resp = client.get("/api/v1/health")
     assert resp.status_code == 200
 
@@ -20,8 +22,8 @@ def test_health_returns_ok_and_version():
     assert body["uptime_seconds"] >= 0
 
 
-def test_health_uptime_grows_monotonically():
-    app = create_app()
+def test_health_uptime_grows_monotonically(tmp_path: Path):
+    app = create_app(db_path=tmp_path / "state.db")
     client = TestClient(app)
     first = client.get("/api/v1/health").json()["uptime_seconds"]
     second = client.get("/api/v1/health").json()["uptime_seconds"]
