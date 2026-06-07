@@ -181,6 +181,49 @@ class ClaudeCodeObserver(Observer):
                 # Meta — skip; not user-relevant for V0.1
                 continue
 
+            # Newly recognized record types from real-world data (M1.3 follow-up)
+            if rtype == "file-history-snapshot":
+                events.append(
+                    Event(
+                        run_id=run.id,
+                        seq=seq,
+                        ts=ts,
+                        kind="artifact_created",
+                        text=f"snapshot: {r.get('snapshotId', '')[:16]}",
+                        payload={"_claude_record": r},
+                    )
+                )
+                seq += 1
+                continue
+
+            if rtype == "skill_listing":
+                events.append(
+                    Event(
+                        run_id=run.id,
+                        seq=seq,
+                        ts=ts,
+                        kind="status_change",
+                        text=f"skills available: {len(r.get('skills', []))}",
+                        payload={"_claude_record": r},
+                    )
+                )
+                seq += 1
+                continue
+
+            if rtype == "deferred_tools_delta":
+                events.append(
+                    Event(
+                        run_id=run.id,
+                        seq=seq,
+                        ts=ts,
+                        kind="status_change",
+                        text="deferred tools updated",
+                        payload={"_claude_record": r},
+                    )
+                )
+                seq += 1
+                continue
+
             # Hook attachment
             if r.get("attachment"):
                 att = r["attachment"]
@@ -191,6 +234,22 @@ class ClaudeCodeObserver(Observer):
                         ts=ts,
                         kind="status_change",
                         text=f"hook: {att.get('hookName', '')}",
+                        payload={"_claude_record": r},
+                    )
+                )
+                seq += 1
+                continue
+
+            # System-injected context (no role, no attachment, just type=system)
+            if rtype == "system" or (role is None and r.get("content") and not r.get("message")):
+                content = r.get("content") or ""
+                events.append(
+                    Event(
+                        run_id=run.id,
+                        seq=seq,
+                        ts=ts,
+                        kind="status_change",
+                        text=f"system: {str(content)[:200]}",
                         payload={"_claude_record": r},
                     )
                 )
