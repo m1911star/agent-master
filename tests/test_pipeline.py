@@ -147,3 +147,40 @@ async def test_global_channel_emits_every_event_not_just_summary(setup):
     assert len(msgs) == 3
     assert all(m["type"] == "event" for m in msgs)
     assert [m["text"] for m in msgs] == ["t0", "t1", "t2"]
+
+
+@pytest.mark.asyncio
+async def test_notify_threadsafe_from_background_thread(setup):
+    """Adapters run in their own threads — notify_threadsafe must schedule
+    the notify coroutine on the loop without deadlocking the publisher."""
+    import threading
+
+    s = setup
+    sub = await s["broker"].subscribe("global")
+
+    fired = threading.Event()
+
+    def adapter_thread() -> None:
+        # Pretend we're an OpenCode/Hermes adapter polling thread.
+        for i in range(5):
+            s["pipeline"].notify_threadsafe(
+                Event(run_id=s["run"].id, kind="user_message", text=f"bg{i}")
+            )
+        fired.set()
+
+    t = threading.Thread(target=adapter_thread)
+    t.start()
+    # Wait for the thread to finish enqueueing
+    assert fired.wait(timeout=2.0)
+    t.join(timeout=2.0)
+
+    # Collect from the loop side
+    received = []
+    for _ in range(5):
+        msg = await asyncio.wait_for(sub.queue.get(), timeout=2.0)
+        received.append(msg)
+
+    assert len(received) == 5
+    assert [m["text"] for m in received] == ["bg0", "bg1", "bg2", "bg3", "bg4"]
+    # All persisted too
+    assert s["pipeline"].stats["events_persisted"] == 5

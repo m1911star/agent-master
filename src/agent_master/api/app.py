@@ -148,20 +148,33 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     def list_session_events(
         session_id: str, after_seq: int | None = None, limit: int = 1000
     ):
-        """Aggregates events from all runs in the session, ordered by ts."""
+        """Aggregates events from all runs in the session, ordered by ts.
+
+        Single JOIN query — avoids the N+1 we'd get from looping over runs.
+        after_seq filter is applied per-run-globally (events with seq >
+        the value); for cross-run pagination prefer cursoring by ts in M1.5.
+        """
         with _conn() as conn:
             if SessionRepo(conn).get(session_id) is None:
                 raise HTTPException(404, f"session {session_id} not found")
-            runs = RunRepo(conn).list_by_session(session_id)
-            all_events = []
-            for r in runs:
-                evs = EventRepo(conn).list_by_run(
-                    r.id, after_seq=after_seq, limit=limit
-                )
-                all_events.extend(evs)
-            # Order by ts; cap at limit.
-            all_events.sort(key=lambda e: e.ts)
-            return [e.to_dict() for e in all_events[:limit]]
+            if after_seq is None:
+                rows = conn.execute(
+                    "SELECT e.* FROM events e "
+                    "JOIN runs r ON e.run_id = r.id "
+                    "WHERE r.session_id = ? "
+                    "ORDER BY e.ts LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT e.* FROM events e "
+                    "JOIN runs r ON e.run_id = r.id "
+                    "WHERE r.session_id = ? AND e.seq > ? "
+                    "ORDER BY e.ts LIMIT ?",
+                    (session_id, after_seq, limit),
+                ).fetchall()
+            from ..models import Event as EventModel
+            return [EventModel.from_row(r).to_dict() for r in rows]
 
     @app.get("/api/v1/runs/{run_id}")
     def get_run(run_id: str):
