@@ -1,0 +1,26 @@
+[adapter]
+name = "opencode"
+version = "0.1.0"
+display_name = "OpenCode"
+
+[capabilities]
+observer = true
+controller = false
+approver = false
+
+[observer]
+# OpenCode persists everything in a single Drizzle-managed SQLite at:
+#   ~/.local/share/opencode/opencode.db
+# Tables we actually read:
+#   - session : top-level work units (parent_id gives topology, has cost+tokens)
+#   - message : one row per turn within a session
+#   - part    : the granular pieces (text / reasoning / tool / step-start /
+#               step-finish / patch / compaction / file / subtask)
+#
+# We tail `part` because it's the lowest-resolution timeline and message is a
+# pure parent of parts.
+db_path = "~/.local/share/opencode/opencode.db"
+poll_interval_ms = 200
+# On startup only hydrate sessions touched in the last N hours — the DB is
+# 350MB+ in active use and a full scan would block the daemon for seconds.
+recent_hours = 24

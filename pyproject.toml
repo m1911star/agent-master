@@ -40,7 +40,7 @@ packages = ["src/agent_master"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "packages/adapters"]
 addopts = "-ra -q"
 
 [tool.ruff]
